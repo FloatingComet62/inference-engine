@@ -29,7 +29,9 @@ public:
     // `cache` must outlive the Model; the model occupies one sequence in it.
     // A new Model always starts a fresh sequence (the cache may keep others).
     // kv_q8: keep the attention working copy as int8 (+ one fp32 scale per head row)
-    Model(const std::string& path, KVCache& cache, bool kv_q8 = false);
+    // stage_only: pipeline stage (multi-machine); weights are paged in lazily, so a rank's
+    // RAM holds only the layers it runs, and the single-sequence working copy is skipped.
+    Model(const std::string& path, KVCache& cache, bool kv_q8 = false, bool stage_only = false);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -50,6 +52,19 @@ public:
     // prefill() calls it at position 0 and skips the matched prefix entirely
     // (its KV rows are read back from the cache). Returns the matched length.
     int use_cached_prefix(const int* tokens, int n);
+
+    // ---- Pipeline stage (src/pipeline.cpp) ----
+    // Owns layers [l0, l1) for up to `slots` independent sequences of up to `ctx` tokens.
+    void stage_init(int l0, int l1, int slots, int ctx);
+    // Runs the owned layers over R rows (R <= PREFILL_CHUNK), in place on x[R][DIM]. Row r is
+    // position pos[r] of sequence slot[r]; rows can mix sequences (micro-batch) and one
+    // sequence's rows must come in position order. Rows share every weight read.
+    void stage_forward(float* x, int R, const int* slot, const int* pos);
+    void embed(const int* tokens, int R, float* x) const;   // x[R][DIM]
+    void head_argmax(float* x, int R, int* out);            // final norm + lm_head + argmax
+    // Bytes of one layer / of the output head (for the layer split).
+    size_t layer_bytes() const;
+    size_t head_bytes() const;
 
     // Bytes of weights streamed from RAM per generated token
     // (everything except the embedding table, of which only one row is read).
@@ -98,6 +113,9 @@ private:
     KVCache* cache_ = nullptr;
     std::map<const void*, std::vector<double>>* calib_ = nullptr;
     SeqId seq_ = -1;
+
+    int st_l0_ = 0, st_l1_ = 0, st_ctx_ = 0, st_slots_ = 0;
+    std::vector<float> st_k_, st_v_;   // [slot][layer - l0][ctx][KV_DIM], keys rotated
 };
 
 }  // namespace tl

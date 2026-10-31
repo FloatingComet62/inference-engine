@@ -64,6 +64,21 @@ do not repeat text; see P5 below for where it pays.
 | 22 | Repetition penalty (`--repeat-penalty`, Ollama's 1.1 in the chat API) + stop strings (`--stop`, Ollama's TinyLlama stops) | fixes greedy loops and the model writing both sides of a dialogue; benchmarks unchanged (penalty off there) | yes |
 | 23 | Chat API temperature default 0.3 (both models set to 0.3 in Open WebUI) | at 0.8 TinyLlama rambles/role-plays; 0.3 gives focused answers | yes |
 | 24 | Dashboard (`/dashboard`) + per-reply speed stats in Open WebUI | results now record suite, model and flags | yes |
+| 25 | OpenMP tuned vs spin pool (`--pool omp` + `OMP_PLACES` P-cores, `OMP_PROC_BIND=close`, `OMP_WAIT_POLICY=active`) | ties: decode 60.5 vs 60.6, prefill 223 vs 226; untuned OpenMP 56 / 198 | no change (pool stays default) |
+| 26 | Multi-machine pipeline over Open MPI (`make mpi-run`, `tinyllama pipe`) with micro-batching | 1 laptop: 4 requests in one micro-batch 183 tok/s total vs 61 for one (3.0x); 8 in one 197. 2 ranks on the SAME laptop: 187 (they share its memory bandwidth, so no gain expected); stream 0 output byte-identical to `run -t 0` | yes (opt-in build, `-DTL_MPI=ON`) |
+
+## Multi-machine (Open MPI)
+
+`make mpi-run NP=2 MPI_IFACE=tailscale0 MPI_HOSTS=100.x.y.z:1,100.a.b.c:1` (or `MPI_IFACE=wlo1`, or `lo` with no hosts for one machine).
+Every machine needs the repo at the same path, `make mpi-build`, `models/tinyllama-q4a.bin` + `tokenizer.bin`,
+Open MPI and passwordless SSH from the first host. `make mpi-bench` sweeps streams x micro-batch into
+`bench/results/mpi.jsonl` (aggregate tok/s, per-stream tok/s, layer split, measured bandwidth/RAM, link RTT, busy %).
+
+- Layers are split by each rank's measured read bandwidth; the output head counts as ~2.6 layers on the last rank.
+  `--split 12,10` overrides. Ranks sharing a machine take separate core slices.
+- One request alone gains nothing from more machines (they take turns, plus a network hop per stage). Gains need
+  `--streams` >= ranks x `--micro`, so every stage always has a micro-batch to work on.
+- `--ctx` caps tokens per request (K/V buffers are per request and per local layer).
 
 ## Things we learned
 

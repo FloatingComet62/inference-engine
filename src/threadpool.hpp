@@ -104,14 +104,19 @@ inline void pin_to(int cpu) {
 #endif
 }
 
+// First fast CPU this process pins to: several MPI ranks on one machine each take
+// their own slice of cores (set by src/pipeline.cpp before Parallel::init).
+inline int g_cpu_offset = 0;
+
 class ThreadPool {
 public:
     explicit ThreadPool(int n) : n_(n < 1 ? 1 : n) {
         const std::vector<int> cpus = fast_cpus();
-        const bool pin = (int)cpus.size() >= n_;   // more threads than fast cores: let the OS place them
-        if (pin) pin_to(cpus[0]);
+        const int o = g_cpu_offset;
+        const bool pin = (int)cpus.size() >= o + n_;   // more threads than fast cores: let the OS place them
+        if (pin) pin_to(cpus[o]);
         for (int t = 1; t < n_; t++)
-            workers_.emplace_back([this, t, pin, cpus] { if (pin) pin_to(cpus[t]); loop(t); });
+            workers_.emplace_back([this, t, pin, o, cpus] { if (pin) pin_to(cpus[o + t]); loop(t); });
     }
     ~ThreadPool() {
         stop_ = true;

@@ -9,3 +9,4 @@ __pycache__/
 bench/data/wikitext2-test.txt
 .webui_secret_key
 *.bk
+build-mpi/

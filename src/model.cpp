@@ -4,6 +4,7 @@
 #include "kernels_attn.hpp"
 #include "threadpool.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -31,7 +32,7 @@ inline void rope(float* v, const float* cs, const float* sn) {
 }
 }  // namespace
 
-Model::Model(const std::string& path, KVCache& cache, bool kv_q8) : kv_q8_(kv_q8), cache_(&cache) {
+Model::Model(const std::string& path, KVCache& cache, bool kv_q8, bool stage_only) : kv_q8_(kv_q8), cache_(&cache) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open weights: " + path + " (run `make setup`)");
     struct stat st{};
@@ -40,7 +41,7 @@ Model::Model(const std::string& path, KVCache& cache, bool kv_q8) : kv_q8_(kv_q8
     map_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (map_ == MAP_FAILED) { map_ = nullptr; throw std::runtime_error("mmap failed"); }
-    madvise(map_, file_size_, MADV_WILLNEED);
+    if (!stage_only) madvise(map_, file_size_, MADV_WILLNEED);
 
     const char* base = static_cast<const char*>(map_);
     if (file_size_ < HEADER_BYTES || std::memcmp(base, "TLM1", 4) != 0)
@@ -96,7 +97,8 @@ Model::Model(const std::string& path, KVCache& cache, bool kv_q8) : kv_q8_(kv_q8
     att_.resize(T * N_HEADS * MAX_SEQ);
     hb_.resize(T * HIDDEN); hb2_.resize(T * HIDDEN); logits_.resize(VOCAB);
     k_tmp_.resize(T * KV_DIM); v_tmp_.resize(T * KV_DIM);
-    if (kv_q8_) {
+    if (stage_only) {
+    } else if (kv_q8_) {
         k8_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
         v8_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
         ks_.resize((size_t)N_LAYERS * MAX_SEQ * N_KV_HEADS);
@@ -293,6 +295,104 @@ void Model::save_quantized(const std::string& path, WType mats, WType head,
     put(w_.final_norm, DIM * sizeof(float));
     put_mat(w_.lm_head, VOCAB, DIM, head);
     if (!f) throw std::runtime_error("write failed: " + path);
+}
+
+size_t Model::layer_bytes() const {
+    const LayerWeights& L = w_.layers[0];
+    return 2 * DIM * sizeof(float) + row_bytes(L.wq.t, DIM) * (DIM + 2 * KV_DIM) + row_bytes(L.wo.t, DIM) * DIM +
+           row_bytes(L.w_gate.t, DIM) * 2 * HIDDEN + row_bytes(L.w_down.t, HIDDEN) * DIM;
+}
+size_t Model::head_bytes() const { return row_bytes(w_.lm_head.t, DIM) * VOCAB + DIM * sizeof(float); }
+
+void Model::stage_init(int l0, int l1, int slots, int ctx) {
+    st_l0_ = l0; st_l1_ = l1; st_slots_ = slots; st_ctx_ = ctx;
+    const size_t n = (size_t)slots * (l1 - l0) * ctx * KV_DIM;
+    st_k_.assign(n, 0.0f);
+    st_v_.assign(n, 0.0f);
+}
+
+void Model::embed(const int* tokens, int R, float* x) const {
+    for (int r = 0; r < R; r++)
+        std::memcpy(x + (size_t)r * DIM, w_.embed + (size_t)tokens[r] * DIM, DIM * sizeof(float));
+}
+
+void Model::head_argmax(float* xin, int R, int* out) {
+    float* x = x_.data();
+    for (int r = 0; r < R; r++) rmsnorm(x + (size_t)r * DIM, xin + (size_t)r * DIM, w_.final_norm, DIM);
+    if (logits_.size() < (size_t)R * VOCAB) logits_.resize((size_t)R * VOCAB);
+    mm(logits_.data(), x, w_.lm_head, DIM, VOCAB, R);
+    for (int r = 0; r < R; r++) {
+        const float* l = logits_.data() + (size_t)r * VOCAB;
+        out[r] = (int)(std::max_element(l, l + VOCAB) - l);
+    }
+}
+
+// Same per-layer maths as forward_batch, but rows may belong to different sequences, each
+// with its own position and its own K/V (no cache backend, no re-basing: ctx is a hard cap).
+void Model::stage_forward(float* xin, int R, const int* slot, const int* pos) {
+    if (R < 1 || R > PREFILL_CHUNK) throw std::runtime_error("stage_forward: bad row count");
+    for (int r = 0; r < R; r++)
+        if (slot[r] < 0 || slot[r] >= st_slots_ || pos[r] < 0 || pos[r] >= st_ctx_)
+            throw std::runtime_error("stage_forward: slot or position out of range (raise --ctx/--streams)");
+    float* x = x_.data();
+    float* xb = xb_.data();
+    float* q = q_.data();
+    float* hb = hb_.data();
+    float* hb2 = hb2_.data();
+    constexpr int half = HEAD_DIM / 2;
+    const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
+    const int nl = st_l1_ - st_l0_;
+    std::memcpy(x, xin, (size_t)R * DIM * sizeof(float));
+
+    for (int l = st_l0_; l < st_l1_; l++) {
+        const LayerWeights& L = w_.layers[l];
+        auto kv_row = [&](std::vector<float>& buf, int s, int p) {
+            return buf.data() + (((size_t)s * nl + (l - st_l0_)) * st_ctx_ + p) * KV_DIM;
+        };
+        for (int r = 0; r < R; r++) rmsnorm(xb + (size_t)r * DIM, x + (size_t)r * DIM, L.attn_norm, DIM);
+        quant_act(xb, L.wq, DIM, R);
+        parallel_for(DIM + 2 * KV_DIM, [&](int b, int e) {
+            auto seg = [&](float* out, int ld, const Mat& m, int lo) {
+                const int sb = b > lo ? b - lo : 0, se = e - lo < ld ? e - lo : ld;
+                if (sb < se) mm_rows(out, ld, xb, m, DIM, sb, se, R);
+            };
+            seg(q, DIM, L.wq, 0);
+            seg(k_tmp_.data(), KV_DIM, L.wk, DIM);
+            seg(v_tmp_.data(), KV_DIM, L.wv, DIM + KV_DIM);
+        });
+        for (int r = 0; r < R; r++) {
+            const float* cs = &rope_cos_[(size_t)pos[r] * half];
+            const float* sn = &rope_sin_[(size_t)pos[r] * half];
+            for (int h = 0; h < N_HEADS; h++) rope(q + (size_t)r * DIM + h * HEAD_DIM, cs, sn);
+            float* kr = kv_row(st_k_, slot[r], pos[r]);
+            std::memcpy(kr, k_tmp_.data() + (size_t)r * KV_DIM, KV_DIM * sizeof(float));
+            for (int h = 0; h < N_KV_HEADS; h++) rope(kr + h * HEAD_DIM, cs, sn);
+            std::memcpy(kv_row(st_v_, slot[r], pos[r]), v_tmp_.data() + (size_t)r * KV_DIM, KV_DIM * sizeof(float));
+        }
+        parallel_for(R * N_HEADS, [&](int b, int e) {
+            for (int idx = b; idx < e; idx++) {
+                const int r = idx / N_HEADS, h = idx % N_HEADS, kvh = h / KV_MUL;
+                attend_head(xb + (size_t)r * DIM + h * HEAD_DIM, q + (size_t)r * DIM + h * HEAD_DIM,
+                            kv_row(st_k_, slot[r], 0) + kvh * HEAD_DIM, kv_row(st_v_, slot[r], 0) + kvh * HEAD_DIM,
+                            KV_DIM, pos[r] + 1, scale, att_.data() + (size_t)idx * MAX_SEQ);
+            }
+        });
+        mm_residual(x, xb, L.wo, DIM, R);
+
+        for (int r = 0; r < R; r++) rmsnorm(xb + (size_t)r * DIM, x + (size_t)r * DIM, L.ffn_norm, DIM);
+        quant_act(xb, L.w_gate, DIM, R);
+        parallel_for(HIDDEN, [&](int b, int e) {
+            mm_rows(hb, HIDDEN, xb, L.w_gate, DIM, b, e, R);
+            mm_rows(hb2, HIDDEN, xb, L.w_up, DIM, b, e, R);
+            for (int t = 0; t < R; t++)
+                for (int i = b; i < e; i++) {
+                    const size_t k = (size_t)t * HIDDEN + i;
+                    hb[k] = silu(hb[k]) * hb2[k];
+                }
+        });
+        mm_residual(x, hb, L.w_down, HIDDEN, R);
+    }
+    std::memcpy(xin, x, (size_t)R * DIM * sizeof(float));
 }
 
 const float* Model::forward_batch(const int* tokens, int T, int pos0, bool all_logits) {

@@ -33,7 +33,7 @@ BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --thread
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui up down
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui up down mpi-build mpi-run mpi-bench
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -46,6 +46,8 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_IFACE=tailscale0 MPI_HOSTS=a:1,b:1)"
+	@echo "  make mpi-bench     MPI throughput sweep (streams x micro-batch) -> bench/results/mpi.jsonl"
 	@echo "  make up            start Ollama + this engine's API + Open WebUI (make down stops them)"
 	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
 	@echo "  make webui         Open WebUI (via uv) on :3000, connected to Ollama + this engine"
@@ -221,3 +223,25 @@ clean:
 
 distclean: clean
 	rm -rf $(MODELS)
+
+# ---- multi-machine: pipeline parallel over Open MPI (src/pipeline.cpp) ----
+# Every machine needs the same repo path, `make mpi-build`, the q4a model and passwordless SSH.
+NP        ?= 2
+MPI_IFACE ?= tailscale0
+MPI_HOSTS ?=
+STREAMS   ?= 4
+MICRO     ?= 4
+MPIRUN    := mpirun -np $(NP) --mca btl tcp,self --mca btl_tcp_if_include $(MPI_IFACE) \
+             $(if $(filter-out lo,$(MPI_IFACE)),--mca oob_tcp_if_include $(MPI_IFACE)) \
+             $(if $(MPI_HOSTS),--host $(MPI_HOSTS))
+
+mpi-build:
+	@cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release -DTL_MPI=ON > /dev/null
+	@cmake --build build-mpi -j
+
+mpi-run: mpi-build
+	$(MPIRUN) build-mpi/tinyllama pipe --model $(MODELS)/tinyllama-q4a.bin --tokenizer $(TOKENIZER) \
+	    -p "$(PROMPT)" -n $(N) --streams $(STREAMS) --micro $(MICRO)
+
+mpi-bench: mpi-build
+	bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)

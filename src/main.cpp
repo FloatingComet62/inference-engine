@@ -7,7 +7,11 @@
 //   tinyllama ppl --text FILE     perplexity + top-1 predictions (quality check);
 //                                 with --ref-model also KL divergence and top-1 agreement
 //   tinyllama quantize --out F    write a Q4 (or --wtype q8) copy of an fp32 model
+//   mpirun -np N tinyllama pipe   pipeline across machines (build with -DTL_MPI=ON)
 #include "kv_cache.hpp"
+#ifdef TL_MPI
+#include "pipeline.hpp"
+#endif
 #include "model.hpp"
 #include "threadpool.hpp"
 #include "sampler.hpp"
@@ -68,11 +72,14 @@ struct Args {
     int sinks = 4;                // streaming: attention-sink tokens
     std::string spec = "off";     // speculative decoding: off | ngram (greedy only)
     int draft_k = 4;              // spec: max drafted tokens per verification
+    int streams = 1;              // pipe: requests in flight
+    int micro = 1;                // pipe: requests per micro-batch
+    std::string split;            // pipe: layers per rank, e.g. "12,10"
 };
 
 [[noreturn]] void usage(int code) {
     std::fprintf(stderr,
-        "usage: tinyllama <run|chat|bench|tokenize|ppl|quantize> [options]\n"
+        "usage: tinyllama <run|chat|bench|tokenize|ppl|quantize|pipe> [options]\n"
         "  --model PATH        weights file   (default models/tinyllama-f32.bin)\n"
         "  --tokenizer PATH    tokenizer file (default models/tokenizer.bin)\n"
         "  -p, --prompt TEXT   user message\n"
@@ -102,7 +109,11 @@ struct Args {
         "  --window N          streaming: window tokens incl. sinks (default 2048)\n"
         "  --sinks N           streaming: attention-sink tokens (default 4)\n"
         "  --spec off|ngram    speculative decoding by prompt lookup (greedy -t 0 only)\n"
-        "  --draft-k K         spec: max drafted tokens per verification (default 4)\n");
+        "  --draft-k K         spec: max drafted tokens per verification (default 4)\n"
+        "  pipe (mpirun, -DTL_MPI=ON): greedy, -n tokens per request, --ctx = max tokens per request\n"
+        "  --streams S         pipe: independent requests in flight (default 1)\n"
+        "  --micro M           pipe: requests per micro-batch (default 1, max 32)\n"
+        "  --split A,B,...     pipe: layers per rank (default: by measured memory bandwidth)\n");
     std::exit(code);
 }
 
@@ -111,7 +122,7 @@ Args parse(int argc, char** argv) {
     if (argc < 2) usage(1);
     a.mode = argv[1];
     if (a.mode == "-h" || a.mode == "--help") usage(0);
-    if (a.mode != "run" && a.mode != "chat" && a.mode != "bench" && a.mode != "tokenize" && a.mode != "ppl" && a.mode != "quantize") usage(1);
+    if (a.mode != "run" && a.mode != "chat" && a.mode != "bench" && a.mode != "tokenize" && a.mode != "ppl" && a.mode != "quantize" && a.mode != "pipe") usage(1);
     for (int i = 2; i < argc; i++) {
         std::string k = argv[i];
         auto val = [&]() -> std::string {
@@ -144,6 +155,9 @@ Args parse(int argc, char** argv) {
         else if (k == "--window") a.window = std::atoi(val().c_str());
         else if (k == "--sinks") a.sinks = std::atoi(val().c_str());
         else if (k == "--spec") a.spec = val();
+        else if (k == "--streams") a.streams = std::atoi(val().c_str());
+        else if (k == "--micro") a.micro = std::atoi(val().c_str());
+        else if (k == "--split") a.split = val();
         else if (k == "--draft-k") a.draft_k = std::atoi(val().c_str());
         else if (k == "-h" || k == "--help") usage(0);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); usage(1); }
@@ -330,6 +344,15 @@ int threads_in_use() { return tl::Parallel::get().n; }
 
 int main(int argc, char** argv) {
     Args a = parse(argc, argv);
+    if (a.mode == "pipe") {
+#ifdef TL_MPI
+        tl::PipeArgs p{a.model, a.tokenizer, a.prompt, a.system, a.split, a.n, a.streams, a.micro, a.ctx, a.threads};
+        return tl::run_pipeline(argc, argv, p);
+#else
+        std::fprintf(stderr, "error: pipe needs an MPI build (cmake -DTL_MPI=ON, or make mpi-build)\n");
+        return 1;
+#endif
+    }
     tl::Parallel::get().init(a.threads, a.pool != "omp");
     g_batch_prefill = a.prefill != "seq";
     try {
