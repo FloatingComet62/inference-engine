@@ -41,7 +41,7 @@ help:
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
 	@echo "  make eval          WikiText-2 perplexity + KL divergence vs fp32"
-	@echo "                     every target takes WTYPE=q4 (default) | q8 | f32"
+	@echo "                     every target takes WTYPE=q4 (default) | q4a | q8 | f32"
 	@echo "  make venv          create the Python virtual environment in .venv"
 	@echo "  make rapl-perms    allow reading CPU energy counters (sudo, until reboot)"
 	@echo "  make smoke         30-second pipeline test with a toy model (no download)"
@@ -88,6 +88,11 @@ $(F32_WEIGHTS): $(MODELS)/model.safetensors scripts/convert.py
 
 $(MODELS)/tinyllama-q4.bin $(MODELS)/tinyllama-q8.bin: $(F32_WEIGHTS) | build
 	@$(BIN) quantize --model $(F32_WEIGHTS) --out $@ --wtype $(patsubst tinyllama-%.bin,%,$(notdir $@))
+
+# Q4 with activation-weighted scales, calibrated on the fp32 model (same format and speed as q4)
+$(MODELS)/tinyllama-q4a.bin: $(F32_WEIGHTS) | build
+	@$(BIN) quantize --model $(F32_WEIGHTS) --tokenizer $(TOKENIZER) --out $@ --wtype q4a \
+	    --text bench/data/eval.txt --max-tokens 512
 
 eval: build model
 	@$(PY) bench/eval.py --bin $(BIN) --model $(WEIGHTS) --ref-model $(F32_WEIGHTS) \

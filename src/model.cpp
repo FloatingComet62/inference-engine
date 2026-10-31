@@ -128,6 +128,13 @@ size_t Model::bytes_per_token() const {
 static constexpr int TR = 2, TC = 4;
 
 void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T) {
+    if (calib_) {
+        auto& acc = (*calib_)[m.w];
+        acc.resize(n_in + 1);
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < n_in; i++) acc[i] += (double)x[(size_t)t * n_in + i] * x[(size_t)t * n_in + i];
+        acc[n_in] += T;
+    }
     if (m.t == WType::F32) {
         const float* W = static_cast<const float*>(m.w);
         parallel_for(n_out, [&](int b, int e) {
@@ -197,7 +204,8 @@ const float* Model::prefill(const int* tokens, int n, int pos) {
     return logits;
 }
 
-void Model::save_quantized(const std::string& path, WType mats, WType head) const {
+void Model::save_quantized(const std::string& path, WType mats, WType head,
+                           const std::map<const void*, std::vector<double>>* act_ms) const {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
     char hdr[HEADER_BYTES] = {};
@@ -219,11 +227,18 @@ void Model::save_quantized(const std::string& path, WType mats, WType head) cons
         if (m.t != WType::F32) throw std::runtime_error("quantize needs an fp32 source model");
         const float* w = static_cast<const float*>(m.w);
         std::vector<char> buf(row_bytes(t, n_in) * n_out);
+        std::vector<float> imp;   // mean x^2 per input channel, if calibrated
+        if (act_ms && t == WType::Q4) {
+            auto it = act_ms->find(m.w);
+            if (it == act_ms->end()) throw std::runtime_error("matrix missing from calibration");
+            for (int i = 0; i < n_in; i++) imp.push_back((float)(it->second[i] / it->second[n_in]));
+        }
 #pragma omp parallel for schedule(static)
         for (int r = 0; r < n_out; r++) {
             char* dst = buf.data() + row_bytes(t, n_in) * r;
             const float* src = w + (size_t)r * n_in;
-            if (t == WType::Q4) quantize_row_q4(src, reinterpret_cast<BlockQ4*>(dst), n_in);
+            if (t == WType::Q4 && !imp.empty()) quantize_row_q4_weighted(src, reinterpret_cast<BlockQ4*>(dst), n_in, imp.data());
+            else if (t == WType::Q4) quantize_row_q4(src, reinterpret_cast<BlockQ4*>(dst), n_in);
             else if (t == WType::Q8) quantize_row_q8(src, reinterpret_cast<BlockQ8*>(dst), n_in);
             else std::memcpy(dst, src, n_in * sizeof(float));
         }
