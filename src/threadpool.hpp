@@ -74,6 +74,25 @@ inline std::vector<int> fast_cpus() {
     return out;
 }
 
+// Default thread count, same rule as scripts/physical_cores.sh: on hybrid Intel the P-cores'
+// hardware threads; otherwise one thread per physical core.
+inline int default_threads() {
+    std::vector<int> cpus = fast_cpus();
+#ifdef __linux__
+    if (!std::ifstream("/sys/devices/cpu_atom/cpus")) {   // not hybrid: primaries only
+        std::vector<int> prim;
+        for (int c : cpus) {
+            std::ifstream sib("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list");
+            int first = c;
+            sib >> first;
+            if (first == c) prim.push_back(c);
+        }
+        cpus = prim;
+    }
+#endif
+    return cpus.empty() ? (int)std::thread::hardware_concurrency() : (int)cpus.size();
+}
+
 inline void pin_to(int cpu) {
 #ifdef __linux__
     cpu_set_t set;
@@ -159,7 +178,7 @@ private:
 struct Parallel {
     static Parallel& get() { static Parallel p; return p; }
     void init(int threads, bool use_pool) {
-        n = threads > 0 ? threads : (int)std::thread::hardware_concurrency();
+        n = threads > 0 ? threads : default_threads();
         pool_on = use_pool;
         pool.reset(use_pool ? new ThreadPool(n) : nullptr);
 #ifdef _OPENMP

@@ -13,6 +13,8 @@ PROMPT       ?= Explain how a CPU cache works, in simple terms.
 OLLAMA_MODEL ?= tinyllama:1.1b
 OLLAMA_URL   ?= http://localhost:11434
 QUALITY      ?= 1
+ENGINE_FLAGS ?=
+# ENGINE_FLAGS: extra engine flags for bench/compare, e.g. ENGINE_FLAGS="--kv q8"
 VENV         ?= .venv
 PY           := $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 
@@ -21,13 +23,13 @@ WTYPE       ?= q4
 F32_WEIGHTS := $(MODELS)/tinyllama-f32.bin
 WEIGHTS     := $(MODELS)/tinyllama-$(WTYPE).bin
 TOKENIZER   := $(MODELS)/tokenizer.bin
-ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS)
+ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) $(ENGINE_FLAGS)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
-               --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) $(if $(filter 1,$(QUALITY)),--quality)
+               --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui webui-stop
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -40,6 +42,8 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
+	@echo "  make webui         Open WebUI (Docker) on :3000, connected to Ollama + this engine"
 	@echo "  make eval          WikiText-2 perplexity + KL divergence vs fp32"
 	@echo "                     every target takes WTYPE=q4 (default) | q4a | q8 | f32"
 	@echo "  make venv          create the Python virtual environment in .venv"
@@ -126,6 +130,26 @@ compare-longer: build model
 
 bandwidth: build
 	@OMP_NUM_THREADS=$(THREADS) $(BUILD)/bandwidth
+
+# ---- chat UI: Open WebUI talking to Ollama and to this engine (OpenAI-compatible API) ----
+API_PORT   ?= 8000
+WEBUI_PORT ?= 3000
+
+serve: build model
+	@$(PY) tools/openai_server.py --port $(API_PORT) --model $(WEIGHTS) --tokenizer $(TOKENIZER) \
+	    --threads $(THREADS) --engine-args "$(ENGINE_FLAGS)"
+
+webui:
+	@docker rm -f open-webui >/dev/null 2>&1 || true
+	docker run -d --name open-webui --network host -v open-webui:/app/backend/data \
+	    -e PORT=$(WEBUI_PORT) -e WEBUI_AUTH=False \
+	    -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+	    -e OPENAI_API_BASE_URL=http://127.0.0.1:$(API_PORT)/v1 -e OPENAI_API_KEY=none \
+	    ghcr.io/open-webui/open-webui:main
+	@echo "Open WebUI: http://localhost:$(WEBUI_PORT)  (also run: make serve, make ollama-serve)"
+
+webui-stop:
+	docker rm -f open-webui
 
 ollama-serve:
 	sudo pkill ollama && OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" ollama serve

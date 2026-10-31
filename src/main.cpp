@@ -45,6 +45,7 @@ struct Args {
     std::string tokenizer = "models/tokenizer.bin";
     std::string prompt = "Hello! Who are you?";
     std::string system = "You are a helpful AI assistant.";
+    std::string messages;  // run: whole conversation file (overrides -p/--system)
     int n = 256;
     float temp = 0.7f;
     float top_p = 0.9f;
@@ -74,6 +75,8 @@ struct Args {
         "  --tokenizer PATH    tokenizer file (default models/tokenizer.bin)\n"
         "  -p, --prompt TEXT   user message\n"
         "  --system TEXT       system prompt\n"
+        "  --messages FILE     run: full conversation, records 'role<US>content' separated by <RS>\n"
+        "                      (ASCII 0x1f / 0x1e); roles system|user|assistant (tools/openai_server.py)\n"
         "  -n N                max new tokens (default 256)\n"
         "  -t, --temp T        temperature, 0 = greedy (default 0.7; bench forces 0)\n"
         "  --top-p P           nucleus sampling (default 0.9)\n"
@@ -115,6 +118,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--tokenizer") a.tokenizer = val();
         else if (k == "-p" || k == "--prompt") a.prompt = val();
         else if (k == "--system") a.system = val();
+        else if (k == "--messages") a.messages = val();
         else if (k == "-n") a.n = std::atoi(val().c_str());
         else if (k == "-t" || k == "--temp") a.temp = std::strtof(val().c_str(), nullptr);
         else if (k == "--top-p") a.top_p = std::strtof(val().c_str(), nullptr);
@@ -278,6 +282,33 @@ double peak_rss_mb() {
 #endif
 }
 
+// Zephyr template for a whole conversation, matching encode_first_turn/encode_next_turn:
+//   <s><|system|>\n{sys}</s>\n<|user|>\n{u}</s>\n<|assistant|>\n{a}</s> ... \n<|assistant|>\n
+std::vector<int> encode_conversation(const tl::Tokenizer& tok, const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open --messages " + path);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string all = ss.str();
+    std::vector<int> ids{tl::BOS};
+    auto add = [&](const std::vector<int>& v) { ids.insert(ids.end(), v.begin(), v.end()); };
+    bool first = true;
+    for (size_t i = 0; i <= all.size();) {
+        size_t j = all.find('\x1e', i);
+        if (j == std::string::npos) j = all.size();
+        const std::string rec = all.substr(i, j - i);
+        i = j + 1;
+        const size_t us = rec.find('\x1f');
+        if (us == std::string::npos) continue;
+        const std::string role = rec.substr(0, us), text = rec.substr(us + 1);
+        if (role != "system" && role != "user" && role != "assistant") continue;
+        add(tok.encode((first ? "<|" : "\n<|") + role + "|>\n" + text, first));
+        ids.push_back(tl::EOS);
+        first = false;
+    }
+    add(tok.encode("\n<|assistant|>\n", false));
+    return ids;
+}
+
 int threads_in_use() { return tl::Parallel::get().n; }
 
 }  // namespace
@@ -338,7 +369,8 @@ int main(int argc, char** argv) {
         int pos = 0;
 
         if (a.mode == "run") {
-            auto prompt = tok.encode_first_turn(a.system, a.prompt);
+            auto prompt = a.messages.empty() ? tok.encode_first_turn(a.system, a.prompt)
+                                             : encode_conversation(tok, a.messages);
             Stats s = generate(model, tok, sampler, prompt, pos, a.n, true, a.ignore_eos);
             std::fprintf(stderr, "\n\n[prompt %d tok, %.1f tok/s | generated %d tok, %.2f tok/s | %d threads"
                          " | cache %zu/%zu tok, %zu evict]\n",
