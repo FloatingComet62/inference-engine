@@ -195,6 +195,15 @@ def run_ollama(a, user):
 
 
 # ---------------------------------------------------------------- helpers
+def physical_cores():
+    """Same default as the Makefile (scripts/physical_cores.sh), not os.cpu_count()."""
+    script = Path(__file__).resolve().parent.parent / "scripts" / "physical_cores.sh"
+    try:
+        return int(subprocess.run([str(script)], capture_output=True, text=True, check=True).stdout)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return os.cpu_count() or 4
+
+
 def measure_bandwidth(a):
     if not a.bandwidth_bin or not Path(a.bandwidth_bin).exists():
         return None
@@ -277,12 +286,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", choices=["engine", "ollama", "both"], default="both")
     ap.add_argument("--bin", default="build/tinyllama")
-    ap.add_argument("--model", default="models/tinyllama-f32.bin")
+    ap.add_argument("--model", default="models/tinyllama-q4.bin")
     ap.add_argument("--tokenizer", default="models/tokenizer.bin")
     ap.add_argument("--bandwidth-bin", default="build/bandwidth")
     ap.add_argument("--ollama-model", default="tinyllama:1.1b")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
-    ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--threads", type=int, default=physical_cores(),
+                    help="default: physical cores (more threads than fast cores disables pinning)")
     ap.add_argument("-n", type=int, default=128, help="max new tokens per run")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--quality", action="store_true", help="also measure perplexity vs fp32 reference")
