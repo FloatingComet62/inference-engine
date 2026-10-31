@@ -48,7 +48,9 @@ private:
 
     std::vector<float> x_, xb_, xb2_, q_, att_, hb_, hb2_, logits_;
     std::vector<float> k_tmp_, v_tmp_;             // [KV_DIM] freshly computed rows
-    std::vector<const float*> k_rows_, v_rows_;    // row pointers for pos 0..pos
+    std::vector<const float*> v_rows_;             // value row pointers, logical pos 0..T
+    std::vector<float> k_rot_;                     // [MAX_SEQ][KV_DIM] scratch: keys
+                                                   // re-rotated at their logical slot
     std::vector<float> rope_cos_, rope_sin_;       // [MAX_SEQ][HEAD_DIM/2]
 
     KVCache* cache_ = nullptr;

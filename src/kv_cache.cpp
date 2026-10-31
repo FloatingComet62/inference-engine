@@ -609,4 +609,113 @@ void RadixKVCache::evict_edge(size_t eid) {
     add_to_lru(parent);   // parent may have become an evictable leaf
 }
 
+// ---------------------------------------------------------------------------
+// StreamingKVCache — StreamingLLM-style fixed window + attention sinks.
+// See kv_cache.hpp for the behavioural contract.
+// ---------------------------------------------------------------------------
+
+StreamingKVCache::StreamingKVCache(size_t window_tokens, int sink_tokens)
+    : window_((int)window_tokens), sink_(sink_tokens),
+      rolling_(window_ - sink_) {
+    if (window_tokens < 1 || (size_t)window_tokens > MAX_SEQ)
+        throw std::invalid_argument("StreamingKVCache: window_tokens must be in [1, MAX_SEQ]");
+    if (sink_tokens < 1 || sink_tokens >= (int)window_tokens)
+        throw std::invalid_argument("StreamingKVCache: sink_tokens must be in [1, window_tokens)");
+}
+
+SeqId StreamingKVCache::begin_sequence() {
+    std::lock_guard<std::mutex> lk(mu_);
+    SeqId id = next_++;
+    Seq& s = seqs_[id];
+    const size_t rows = (size_t)window_ * N_LAYERS * KV_DIM;
+    s.keys.assign(rows, 0.0f);
+    s.vals.assign(rows, 0.0f);
+    return id;
+}
+
+void StreamingKVCache::end_sequence(SeqId seq) {
+    std::lock_guard<std::mutex> lk(mu_);
+    seqs_.erase(seq);
+}
+
+void StreamingKVCache::clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    seqs_.clear();
+    next_ = 0;
+    evictions_ = 0;
+    row_fetches_ = 0;
+}
+
+void StreamingKVCache::store(SeqId seq, int layer, int pos, int token,
+                             const float* k_row, const float* v_row) {
+    (void)token;  // content is implied by pos; no content-keyed reuse
+    std::lock_guard<std::mutex> lk(mu_);
+    Seq& s = seqs_.at(seq);  // unknown seq -> engine bug, surface it
+    if (layer < 0 || layer >= N_LAYERS || pos < 0)
+        throw std::out_of_range("streaming kv cache store out of range");
+    const int slot = slot_of(pos);
+    if (layer == 0) {
+        // Per-position bookkeeping, once per position: a rolling store
+        // overwrites a live slot once the ring has wrapped back to it
+        // (pos - sink_ >= rolling_ with in-order stores).
+        if (pos >= sink_ && pos - sink_ >= rolling_) evictions_++;
+        if (pos >= s.processed) s.processed = pos + 1;  // rewinds keep max
+    }
+    const size_t off = ((size_t)slot * N_LAYERS + layer) * KV_DIM;
+    std::memcpy(&s.keys[off], k_row, (size_t)KV_DIM * sizeof(float));
+    std::memcpy(&s.vals[off], v_row, (size_t)KV_DIM * sizeof(float));
+}
+
+int StreamingKVCache::stored_tokens(SeqId seq) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const Seq& s = seqs_.at(seq);
+    return s.processed < window_ ? s.processed : window_;
+}
+
+const float* StreamingKVCache::key_row(SeqId seq, int layer, int pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const Seq& s = seqs_.at(seq);
+    const int stored = s.processed < window_ ? s.processed : window_;
+    if (layer < 0 || layer >= N_LAYERS || pos < 0 || pos >= stored)
+        throw std::out_of_range("streaming kv cache row out of range");
+    ++row_fetches_;
+    return &s.keys[((size_t)logical_slot(s, pos) * N_LAYERS + layer) * KV_DIM];
+}
+
+const float* StreamingKVCache::value_row(SeqId seq, int layer, int pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const Seq& s = seqs_.at(seq);
+    const int stored = s.processed < window_ ? s.processed : window_;
+    if (layer < 0 || layer >= N_LAYERS || pos < 0 || pos >= stored)
+        throw std::out_of_range("streaming kv cache row out of range");
+    ++row_fetches_;
+    return &s.vals[((size_t)logical_slot(s, pos) * N_LAYERS + layer) * KV_DIM];
+}
+
+int StreamingKVCache::longest_cached_prefix(SeqId seq, const int* tokens, int n) const {
+    // Streaming keeps no content-keyed history (reference §5.5): sinks are
+    // attention sinks, not reusable prefixes. The engine then recomputes
+    // everything, which is correct for this backend.
+    (void)seq; (void)tokens; (void)n;
+    return 0;
+}
+
+size_t StreamingKVCache::capacity_tokens() const {
+    return (size_t)window_;
+}
+
+size_t StreamingKVCache::used_tokens() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t total = 0;
+    for (const auto& [_, s] : seqs_) total += (size_t)(s.processed < window_ ? s.processed : window_);
+    return total;
+}
+
+KVCacheStats StreamingKVCache::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t used = 0;
+    for (const auto& [_, s] : seqs_) used += (size_t)(s.processed < window_ ? s.processed : window_);
+    return {seqs_.size(), used, used * ROW_BYTES, row_fetches_, 0, 0, evictions_};
+}
+
 }  // namespace tl

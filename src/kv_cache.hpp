@@ -10,7 +10,9 @@
 //   PagedKVCache     fixed-size token blocks + block tables (vLLM style)
 //   RadixKVCache     global radix tree of token prefixes + shared KV pages,
 //                    LRU leaf eviction (RadixAttention, the engine default)
-// Planned: FreeOnFinish (drop a sequence's rows when it ends), BoundedGrowth.
+//   StreamingKVCache fixed-size rolling window + attention sinks
+//                    (StreamingLLM; bounded growth for long sequences)
+// Planned: FreeOnFinish (drop a sequence's rows when it ends).
 //
 // Contracts (implementations must honour; the engine relies on them):
 //   * A row is KV_DIM contiguous floats. The returned pointer stays valid
@@ -316,6 +318,100 @@ private:
     mutable uint64_t clock_ = 0;
     mutable std::mutex mu_;
     mutable size_t row_fetches_ = 0, prefix_checks_ = 0, prefix_hits_ = 0;
+};
+
+// StreamingLLM (arXiv:2309.17453) KV cache: a fixed-size attention window
+// with permanently retained "attention sinks" — the first sink_tokens of the
+// sequence (default 4, the paper's recommendation for pretrained models).
+// Each sequence owns two regions: sink slots (written once, never evicted)
+// and a circular rolling buffer holding the most recent tokens. Retention is
+// therefore BOUNDED: stored_tokens() caps at window_tokens no matter how long
+// the absolute sequence grows, so KV memory never grows and attention cost is
+// O(window) per step. Distinct from RadixKVCache: this retains data within
+// one continuously growing sequence; it does no cross-sequence reuse.
+//
+// Position model (the engine's side of the RoPE re-basing contract, see
+// Model::forward in model.cpp):
+//   * store()'s `pos` is the token's ORIGINAL position and its physical slot
+//     is a deterministic function of pos: slot = pos for pos < sink_tokens,
+//     else sink_tokens + (pos - sink_tokens) % rolling_capacity. Determinism
+//     makes ppl-style rewinds overwrite the same slot, and the oldest rolling
+//     token is always the next slot reused (the paper's eviction order).
+//   * key_row()/value_row() take a LOGICAL cache position: 0..sink-1 are the
+//     sinks, sink..stored-1 the rolling tokens in chronological order. The
+//     attention kernel iterates [0, stored_tokens(seq)) and applies RoPE at
+//     the LOGICAL position — so keys are stored UNROTATED and the model
+//     rotates each key at read time (evicting shifts every survivor's logical
+//     slot down, invalidating any rotation baked in at store time).
+//
+// Behavioural notes:
+//   * capacity_tokens() = window_tokens (per sequence). Storage is allocated
+//     up front per sequence: peak KV memory is fixed at capacity, which is
+//     the point of the algorithm. Positions beyond MAX_SEQ are accepted by
+//     store() (arbitrarily long streams); the CLI still caps the engine at
+//     MAX_SEQ positions.
+//   * longest_cached_prefix() returns 0 always: streaming keeps no
+//     content-keyed history (attention sinks are not prefix caching).
+//   * evictions_ counts every store that overwrites a live rolling slot
+//     ("rolling-cache token positions overwritten", reference §5.9).
+//   * Row pointers stay valid until the backing slot is overwritten by a
+//     later store() on the same sequence; the engine holds rows across one
+//     forward pass only.
+//   * Unknown sequences throw (engine bug), mirroring the other backends.
+class StreamingKVCache : public KVCache {
+public:
+    explicit StreamingKVCache(size_t window_tokens = MAX_SEQ, int sink_tokens = 4);
+
+    SeqId begin_sequence() override;
+    void end_sequence(SeqId seq) override;
+    void clear() override;
+
+    void store(SeqId seq, int layer, int pos, int token,
+               const float* k_row, const float* v_row) override;
+    const float* key_row(SeqId seq, int layer, int pos) const override;
+    const float* value_row(SeqId seq, int layer, int pos) const override;
+    int stored_tokens(SeqId seq) const override;
+
+    int longest_cached_prefix(SeqId seq, const int* tokens, int n) const override;
+
+    size_t capacity_tokens() const override;
+    size_t used_tokens() const override;
+    KVCacheStats stats() const override;
+
+private:
+    struct Seq {
+        std::vector<float> keys, vals;   // [window_][N_LAYERS][KV_DIM]
+        int processed = 0;               // absolute length stored so far
+    };
+    static constexpr size_t ROW_BYTES =
+        (size_t)2 * N_LAYERS * KV_DIM * sizeof(float);
+    // Physical slot for a store at original position pos. Called with the
+    // position held; the ring offset is a pure function of pos so rewinds
+    // land on the same slot.
+    int slot_of(int pos) const {
+        return pos < sink_ ? pos : sink_ + (pos - sink_) % rolling_;
+    }
+    // Physical slot for a LOGICAL read position (chronological sinks +
+    // rolling; oldest rolling token at stored-sink, newest last). The
+    // retained rolling tokens occupy `roll` consecutive ring slots ending at
+    // the write cursor; the mapping walks back from the cursor, which is the
+    // identity while the ring is still warming and wraps once it is full.
+    int logical_slot(const Seq& s, int logical) const {
+        if (logical < sink_) return logical;
+        const int rolled = s.processed - sink_;            // rolling stores made
+        const int roll = rolled < rolling_ ? rolled : rolling_;  // retained
+        const int nw = rolled % rolling_;                  // ring write cursor
+        int ring = nw - roll + (logical - sink_);
+        ring %= rolling_;
+        if (ring < 0) ring += rolling_;
+        return sink_ + ring;
+    }
+    int window_, sink_, rolling_;
+    std::unordered_map<SeqId, Seq> seqs_;
+    SeqId next_ = 0;
+    size_t evictions_ = 0;
+    mutable size_t row_fetches_ = 0;
+    mutable std::mutex mu_;   // reads under a lock; writes single-threaded
 };
 
 }  // namespace tl

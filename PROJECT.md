@@ -21,7 +21,7 @@ State: baseline works end-to-end (real weights downloaded in `models/`,
 | --- | --- |
 | `src/config.hpp` | All model sizes as compile-time constants. `TL_TINY_TEST` switches to toy sizes. |
 | `src/kernels.hpp` | `matmul`, `rmsnorm`, `softmax`, `silu`. **Optimise here first.** |
-| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface; `RadixKVCache` (engine default, radix-tree prefix reuse) + `PagedKVCache` + `BaselineKVCache` (backups). |
+| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface; `RadixKVCache` (engine default, radix-tree prefix reuse) + `StreamingKVCache` (bounded window + sinks) + `PagedKVCache` + `BaselineKVCache`. |
 | `src/model.cpp` | mmap weight loading, forward pass (uses a `KVCache&`), RoPE cache. |
 | `src/tokenizer.hpp/.cpp` | SentencePiece-style BPE + Zephyr template. |
 | `src/sampler.hpp` | greedy / temperature / top-p. |
@@ -138,8 +138,8 @@ cores via `scripts/physical_cores.sh`), `N`, `RUNS`, `TEMP`, `PROMPT`, `BUILD`.
 ## KV cache experiments (in progress)
 
 `src/kv_cache.hpp` defines the interface (per-token rows, sequence handles,
-content-keyed prefix API, capacity + stats). Three backends live in
-`src/kv_cache.cpp`:
+content-keyed prefix API, capacity + stats). Four backends live in
+`src/kv_cache.cpp` (pick with `--cache baseline|paged|radix|streaming`):
 
 - **`RadixKVCache`** — engine default. RadixAttention (SGLang,
   arXiv:2312.07104): a global compressed radix tree of token prefixes
@@ -150,26 +150,40 @@ content-keyed prefix API, capacity + stats). Three backends live in
   *leaf* when the shared pool (default `MAX_SEQ` = 2048 pages, 360 KB each on
   the real model) is exhausted. `store()` on a matched position is a no-op;
   positions beyond a match are the sequence's own pages (rewritable).
+- **`StreamingKVCache`** — StreamingLLM (arXiv:2309.17453), bounded growth:
+  per-sequence fixed window = attention sinks (first `--sinks` tokens, never
+  evicted) + a circular rolling buffer of the most recent tokens. Retention
+  caps at the window (`stored_tokens` ≤ window regardless of absolute length),
+  so KV memory and attention cost are O(window) — verified up to 1M stored
+  positions. Deterministic slot-per-position eviction (oldest rolling token
+  first, counted in stats). Rewind-safe: re-storing a position lands on its
+  own slot. CLI: `--cache streaming --window N [--sinks N]`.
 - **`PagedKVCache`** — PagedAttention (SOSP'23): fixed block pool + per-seq
   block tables; `store()` throws on pool exhaustion (no eviction).
-- **`BaselineKVCache`** — flat per-sequence arrays, kept for A/B; swap back
-  at the single construction site in `src/main.cpp`.
+- **`BaselineKVCache`** — flat per-sequence arrays, kept for A/B.
 
 Engine wiring: `Model::use_cached_prefix()` calls `longest_cached_prefix`
-before prefilling; `Model::forward` skips the K/V matmuls + `store()` for
-positions inside the matched prefix and reads those rows back from the cache
-(attention math unchanged, so output is byte-identical — verified). The cache
-instance is shared across `Model`s, so a second request whose prompt repeats a
-completed sequence's prefix skips recomputing it entirely (no duplicated KV
-pages: verified, e.g. `used_tokens` 29 = 17 shared + 12 new for a repeated
-5-token prompt + 12 decoded tokens).
+before prefilling (streaming returns 0 — no content reuse); `Model::forward`
+skips the K/V matmuls + `store()` for positions inside the matched prefix and
+reads those rows back from the cache. Keys are stored **unrotated**; `forward`
+rotates each key at its *logical* cache position right before attention and
+rotates the query at its own slot — the RoPE re-basing tracking RollingLLM
+requires once eviction shifts survivors' positions. For non-evicting backends
+logical == absolute position, so this is mathematically identical (run/ppl
+byte-identical, verified). `forward` also bounds attention to
+`min(stored_tokens, pos+1)` positions, so a streaming window keeps attention
+bounded. The cache instance is shared across `Model`s, so a second request
+whose prompt repeats a completed sequence's prefix skips recomputing it
+entirely (no duplicated KV pages: verified, e.g. `used_tokens` 29 = 17 shared
++ 12 new for a repeated 5-token prompt + 12 decoded tokens). The run/chat
+footers print `cache used/cap tok, evictions`.
 
-Remaining experiments: `FreeOnFinish` (drop rows at end), `BoundedGrowth`
-(eviction under a cap). `ppl` deliberately does not consult the prefix API
-(fully independent-chunk scoring, byte-identical). One caveat: the CLI is
-single-request (run/chat/ppl), so cross-request reuse shows in a runtime that
-keeps one cache across requests — the interface tests + a two-`Model` harness
-cover it.
+Remaining experiment: `FreeOnFinish` (drop rows at end). `ppl` deliberately
+does not consult the prefix API (fully independent-chunk scoring,
+byte-identical). Caveats: the CLI is single-request (run/chat/ppl), so
+cross-request radix reuse shows in a runtime that keeps one cache across
+requests — the interface tests + a two-`Model` harness cover it; streaming's
+cross-request sharing is N/A by design (per-sequence windows).
 
 ## Planned next steps (from PLAN.md, in priority order)
 

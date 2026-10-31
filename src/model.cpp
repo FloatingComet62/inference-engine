@@ -75,7 +75,8 @@ Model::Model(const std::string& path, KVCache& cache) : cache_(&cache) {
     att_.resize((size_t)N_HEADS * MAX_SEQ);
     hb_.resize(HIDDEN); hb2_.resize(HIDDEN); logits_.resize(VOCAB);
     k_tmp_.resize(KV_DIM); v_tmp_.resize(KV_DIM);
-    k_rows_.resize(MAX_SEQ); v_rows_.resize(MAX_SEQ);
+    k_rot_.resize((size_t)MAX_SEQ * KV_DIM);
+    v_rows_.resize(MAX_SEQ);
     seq_ = cache_->begin_sequence();
 
     constexpr int half = HEAD_DIM / 2;
@@ -110,9 +111,18 @@ const float* Model::forward(int token, int pos) {
     float* q = q_.data();
     float* hb = hb_.data();
     float* hb2 = hb2_.data();
-    const float* cs = &rope_cos_[(size_t)pos * (HEAD_DIM / 2)];
-    const float* sn = &rope_sin_[(size_t)pos * (HEAD_DIM / 2)];
+    constexpr int half = HEAD_DIM / 2;
     const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
+
+    // Cache-relative position of this token (RoPE re-basing, StreamingLLM).
+    // Non-evicting backends always position a token at its original `pos`
+    // (ppl rewinds re-store positions in place), so qpos == pos is the
+    // identity there. A streaming backend re-bases once the window is full:
+    // the newest token sits at the last retained slot (capacity-1).
+    const int cap = (int)cache_->capacity_tokens();
+    const int qpos = pos < cap ? pos : cap - 1;
+    const float* cs = &rope_cos_[(size_t)qpos * half];
+    const float* sn = &rope_sin_[(size_t)qpos * half];
 
     std::memcpy(x, w_.embed + (size_t)token * DIM, DIM * sizeof(float));
 
@@ -126,14 +136,28 @@ const float* Model::forward(int token, int pos) {
         if (pos >= matched_) {   // cached prefix: rows read back below, not recomputed
             matmul(k_tmp_.data(), xb, L.wk, DIM, KV_DIM);
             matmul(v_tmp_.data(), xb, L.wv, DIM, KV_DIM);
-            for (int h = 0; h < N_KV_HEADS; h++) rope(k_tmp_.data() + h * HEAD_DIM, cs, sn);
+            // K is stored UNROTATED: rolling eviction re-bases every retained
+            // key to a new logical slot, so the rotation is applied per read
+            // below (at the logical position) instead of baked in here.
             cache_->store(seq_, l, pos, token, k_tmp_.data(), v_tmp_.data());
         }
 
-        // Per-position row pointers (single-threaded; the parallel loop only reads).
-        for (int t = 0; t <= pos; t++) {
-            k_rows_[t] = cache_->key_row(seq_, l, t);
+        // Value rows + keys re-rotated at their LOGICAL slot over the retained
+        // window. T is bounded by both what the cache retains (streaming
+        // eviction) and the current prefill window: ppl-style rewinds re-store
+        // positions [0, pos] but the cache may still hold later ones. Identity
+        // for non-evicting backends (stored == pos+1), so their attention math
+        // is unchanged and byte-identical. Single-threaded; parallel loop only reads.
+        const int stored = cache_->stored_tokens(seq_);
+        const int T = stored < pos + 1 ? stored : pos + 1;
+        for (int t = 0; t < T; t++) {
             v_rows_[t] = cache_->value_row(seq_, l, t);
+            const float* kt = cache_->key_row(seq_, l, t);
+            float* kr = k_rot_.data() + (size_t)t * KV_DIM;
+            std::memcpy(kr, kt, KV_DIM * sizeof(float));
+            for (int h = 0; h < N_KV_HEADS; h++)
+                rope(kr + h * HEAD_DIM, &rope_cos_[(size_t)t * half],
+                     &rope_sin_[(size_t)t * half]);
         }
 
 #pragma omp parallel for schedule(static)
@@ -141,16 +165,16 @@ const float* Model::forward(int token, int pos) {
             const float* qh = q + h * HEAD_DIM;
             float* att = att_.data() + (size_t)h * MAX_SEQ;
             const int kvh = h / KV_MUL;
-            for (int t = 0; t <= pos; t++) {
-                const float* kt = k_rows_[t] + kvh * HEAD_DIM;
+            for (int t = 0; t < T; t++) {
+                const float* kt = k_rot_.data() + ((size_t)t * KV_DIM + kvh * HEAD_DIM);
                 float s = 0.0f;
                 for (int i = 0; i < HEAD_DIM; i++) s += qh[i] * kt[i];
                 att[t] = s * scale;
             }
-            softmax(att, pos + 1);
+            softmax(att, T);
             float* out = xb + h * HEAD_DIM;
             std::memset(out, 0, HEAD_DIM * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t < T; t++) {
                 const float* vt = v_rows_[t] + kvh * HEAD_DIM;
                 const float a = att[t];
                 for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
