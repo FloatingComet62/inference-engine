@@ -59,6 +59,7 @@ struct Args {
     std::string wtype = "q4";  // quantize: q4 | q8
     std::string pool = "spin";     // spin (persistent pool) | omp
     std::string prefill = "batch"; // batch | seq (token by token)
+    std::string kv = "f32";       // attention working copy: f32|q8
     std::string cache = "radix";  // baseline|paged|radix|streaming
     int window = tl::MAX_SEQ;     // streaming: window tokens (incl. sinks)
     int sinks = 4;                // streaming: attention-sink tokens
@@ -85,6 +86,7 @@ struct Args {
         "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n"
         "  --pool spin|omp     thread runtime (default spin)\n"
         "  --prefill batch|seq prompt processing (default batch)\n"
+        "  --kv f32|q8         attention KV working copy precision (default f32)\n"
         "  --cache NAME        kv cache backend: baseline|paged|radix|streaming\n"
         "                      (default radix)\n"
         "  --window N          streaming: window tokens incl. sinks (default 2048)\n"
@@ -123,6 +125,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--pool") a.pool = val();
         else if (k == "--prefill") a.prefill = val();
         else if (k == "--cache") a.cache = val();
+        else if (k == "--kv") a.kv = val();
         else if (k == "--window") a.window = std::atoi(val().c_str());
         else if (k == "--sinks") a.sinks = std::atoi(val().c_str());
         else if (k == "-h" || k == "--help") usage(0);
@@ -221,6 +224,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "wrote %s\n", a.out.c_str());
             return 0;
         }
+        if (a.kv != "f32" && a.kv != "q8") throw std::runtime_error("unknown --kv " + a.kv + " (f32|q8)");
         auto t_load = Clock::now();
         std::unique_ptr<tl::KVCache> kv_cache;
         if (a.cache == "baseline") kv_cache = std::make_unique<tl::BaselineKVCache>();
@@ -231,7 +235,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unknown --cache " + a.cache +
                                      " (baseline|paged|radix|streaming)");
         else kv_cache = std::make_unique<tl::RadixKVCache>();  // default: prefix reuse
-        tl::Model model(a.model, *kv_cache);
+        tl::Model model(a.model, *kv_cache, a.kv == "q8");
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);
         tl::Sampler sampler(a.temp, a.top_p, a.seed);

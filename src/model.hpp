@@ -27,7 +27,8 @@ class Model {
 public:
     // `cache` must outlive the Model; the model occupies one sequence in it.
     // A new Model always starts a fresh sequence (the cache may keep others).
-    Model(const std::string& path, KVCache& cache);
+    // kv_q8: keep the attention working copy as int8 (+ one fp32 scale per head row)
+    Model(const std::string& path, KVCache& cache, bool kv_q8 = false);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -75,6 +76,10 @@ private:
     // is re-stored (ppl rewinds), so only new slots are copied each step and
     // everything is recopied after a re-base.
     std::vector<float> k_rot_, v_work_;            // [N_LAYERS][MAX_SEQ][KV_DIM]
+    // --kv q8: the same working copy as int8 plus one scale per head row (the fp32 one is unused)
+    bool kv_q8_ = false;
+    std::vector<int8_t> k8_, v8_;                  // [N_LAYERS][MAX_SEQ][KV_DIM]
+    std::vector<float> ks_, vs_;                   // [N_LAYERS][MAX_SEQ][N_KV_HEADS]
     int work_valid_ = 0;                           // slots [0, work_valid_) are current
     std::vector<float> rope_cos_, rope_sin_;       // [MAX_SEQ][HEAD_DIM/2]
 
