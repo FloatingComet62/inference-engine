@@ -10,7 +10,7 @@ NP=${1:?np}; IFACE=${2:?iface}; HOSTS=${3:-}; N=${4:-64}
 OUT=bench/results/mpi.jsonl
 mkdir -p bench/results
 MPI=(mpirun -np "$NP" --mca btl tcp,self --mca btl_tcp_if_include "$IFACE")
-[ "$IFACE" != lo ] && MPI+=(--mca oob_tcp_if_include "$IFACE")   # control channel refuses loopback
+[ "$IFACE" != lo ] && MPI+=(--prtemca oob_tcp_if_include "$IFACE")   # launcher's channel; refuses loopback
 [ -n "$HOSTS" ] && MPI+=(--host "$HOSTS")
 for cfg in "1 1" "4 1" "4 4" "8 4" "8 8" "16 8"; do
     set -- $cfg

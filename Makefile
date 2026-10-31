@@ -231,12 +231,19 @@ MPI_IFACE ?= $(shell scripts/lan_subnet.sh)
 MPI_HOSTS ?=
 STREAMS   ?= 4
 MICRO     ?= 4
-MPIRUN    := mpirun -np $(NP) --mca btl tcp,self --mca btl_tcp_if_include $(MPI_IFACE) \
-             $(if $(filter-out lo,$(MPI_IFACE)),--mca oob_tcp_if_include $(MPI_IFACE)) \
+# Every machine must run the SAME Open MPI version. A copy built into ~/.local/openmpi-<ver>
+# (to match the other machines' packages) is used automatically; else the system one.
+MPI_HOME  ?= $(lastword $(wildcard $(HOME)/.local/openmpi-*))
+MPI_BIN   := $(if $(MPI_HOME),$(MPI_HOME)/bin/,)
+# mpirun via PATH, not by full path: a full path makes the other machines look for
+# Open MPI at that same prefix instead of using their own install.
+MPIRUN    := $(if $(MPI_HOME),PATH=$(MPI_BIN):$$PATH) mpirun -np $(NP) --mca btl tcp,self --mca btl_tcp_if_include $(MPI_IFACE) \
+             $(if $(filter-out lo,$(MPI_IFACE)),--prtemca oob_tcp_if_include $(MPI_IFACE)) \
              $(if $(MPI_HOSTS),--host $(MPI_HOSTS))
 
 mpi-build:
-	@cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release -DTL_MPI=ON > /dev/null
+	@cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release -DTL_MPI=ON \
+	    $(if $(MPI_HOME),-DMPI_CXX_COMPILER=$(MPI_BIN)mpicxx) > /dev/null
 	@cmake --build build-mpi -j
 
 mpi-run: mpi-build
@@ -244,4 +251,4 @@ mpi-run: mpi-build
 	    -p "$(PROMPT)" -n $(N) --streams $(STREAMS) --micro $(MICRO)
 
 mpi-bench: mpi-build
-	bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)
+	$(if $(MPI_HOME),PATH=$(MPI_BIN):$$PATH) bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)
