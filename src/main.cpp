@@ -45,7 +45,9 @@ struct Args {
     std::string tokenizer = "models/tokenizer.bin";
     std::string prompt = "Hello! Who are you?";
     std::string system = "You are a helpful AI assistant.";
-    std::string messages;  // run: whole conversation file (overrides -p/--system)
+    std::string messages;
+    float repeat_penalty = 1.0f;
+    std::vector<std::string> stops;   // run/chat: end the reply when the output contains one   // 1 = off (benchmarks stay greedy-exact); chat bridge uses 1.1  // run: whole conversation file (overrides -p/--system)
     int n = 256;
     float temp = 0.7f;
     float top_p = 0.9f;
@@ -75,6 +77,8 @@ struct Args {
         "  --tokenizer PATH    tokenizer file (default models/tokenizer.bin)\n"
         "  -p, --prompt TEXT   user message\n"
         "  --system TEXT       system prompt\n"
+        "  --stop TEXT         end the reply when TEXT appears (repeatable; e.g. \"<|user|>\")\n"
+        "  --repeat-penalty P  penalise the last 64 sampled tokens (1 = off; Ollama uses 1.1)\n"
         "  --messages FILE     run: full conversation, records 'role<US>content' separated by <RS>\n"
         "                      (ASCII 0x1f / 0x1e); roles system|user|assistant (tools/openai_server.py)\n"
         "  -n N                max new tokens (default 256)\n"
@@ -119,6 +123,8 @@ Args parse(int argc, char** argv) {
         else if (k == "-p" || k == "--prompt") a.prompt = val();
         else if (k == "--system") a.system = val();
         else if (k == "--messages") a.messages = val();
+        else if (k == "--stop") a.stops.push_back(val());
+        else if (k == "--repeat-penalty") a.repeat_penalty = std::strtof(val().c_str(), nullptr);
         else if (k == "-n") a.n = std::atoi(val().c_str());
         else if (k == "-t" || k == "--temp") a.temp = std::strtof(val().c_str(), nullptr);
         else if (k == "--top-p") a.top_p = std::strtof(val().c_str(), nullptr);
@@ -166,6 +172,17 @@ double cpu_ms_now() {
 // Feeds `prompt` starting at `pos`, then samples up to max_new tokens.
 // Every sampled token is fed back so the KV cache stays complete for chat.
 bool g_batch_prefill = true;
+std::vector<std::string> g_stops;   // --stop strings
+
+// Appends generated text and reports whether it now contains a stop string.
+bool hits_stop(std::string& tail, const std::string& piece) {
+    if (g_stops.empty()) return false;
+    tail += piece;
+    for (const auto& s : g_stops)
+        if (!s.empty() && tail.find(s) != std::string::npos) return true;
+    if (tail.size() > 256) tail.erase(0, tail.size() - 128);
+    return false;
+}
 int g_draft_k = 0;
 int g_cache_cap = tl::MAX_SEQ;   // spec: never verify across a streaming re-base   // > 0: greedy speculative decoding with prompt-lookup drafts
 
@@ -204,13 +221,14 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
     st.prefill_ms = ms_since(t0);
 
     auto t1 = Clock::now();
+    std::string tail;      // recent output, for --stop
+    bool stopped = false;
     auto emit = [&](int t) {
         st.gen_tokens++;
-        if (!stream) return;
         std::string piece = tok.decode(t);
         if (st.gen_tokens == 1 && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
-        std::fwrite(piece.data(), 1, piece.size(), stdout);
-        std::fflush(stdout);
+        if (stream) { std::fwrite(piece.data(), 1, piece.size(), stdout); std::fflush(stdout); }
+        stopped = hits_stop(tail, piece);
     };
     if (g_draft_k > 0) {
         // Greedy speculative decoding. `next` is the model's token for position pos.
@@ -225,6 +243,7 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
             if (next == tl::EOS && !ignore_eos) break;
             if (st.gen_tokens >= max_new || pos >= tl::MAX_SEQ) break;
             emit(next);
+            if (stopped) break;
             hist.push_back(next);
             const int room = std::min({max_new - st.gen_tokens, tl::MAX_SEQ - pos - 1, g_cache_cap - pos - 1});
             ngram_draft(hist, std::min(g_draft_k, room), draft);
@@ -247,6 +266,7 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
                 if (draft[i] == tl::EOS && !ignore_eos) { stop = true; break; }
                 emit(draft[i]);
                 hist.push_back(draft[i]);
+                if (stopped) stop = true;
             }
             if (stop) break;
         }
@@ -258,13 +278,8 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
         int next = sampler.sample(logits);
         if (st.ttft_ms == 0) st.ttft_ms = ms_since(t0);
         if (next == tl::EOS && !ignore_eos) break;
-        st.gen_tokens++;
-        if (stream) {
-            std::string piece = tok.decode(next);
-            if (st.gen_tokens == 1 && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
-            std::fwrite(piece.data(), 1, piece.size(), stdout);
-            std::fflush(stdout);
-        }
+        emit(next);
+        if (stopped) break;
         logits = model.forward(next, pos++);
     }
     st.decode_ms = ms_since(t1);
@@ -362,10 +377,12 @@ int main(int argc, char** argv) {
         tl::Model model(a.model, *kv_cache, a.kv == "q8");
         g_cache_cap = (int)kv_cache->capacity_tokens();
         // temperature > 0 falls back to normal decoding (no rejection sampling)
-        if (a.spec == "ngram" && a.temp <= 0.0f) g_draft_k = a.draft_k;
+        // speculative verification compares raw argmax, so it needs plain greedy sampling
+        if (a.spec == "ngram" && a.temp <= 0.0f && a.repeat_penalty == 1.0f) g_draft_k = a.draft_k;
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);
-        tl::Sampler sampler(a.temp, a.top_p, a.seed);
+        tl::Sampler sampler(a.temp, a.top_p, a.seed, a.repeat_penalty);
+        g_stops = a.stops;
         int pos = 0;
 
         if (a.mode == "run") {

@@ -10,10 +10,27 @@ namespace tl {
 
 class Sampler {
 public:
-    Sampler(float temperature, float top_p, uint64_t seed)
-        : temp_(temperature), top_p_(top_p), rng_(seed) {}
+    // repeat_penalty > 1 discourages tokens among the last `repeat_last_n` sampled ones
+    // (llama.cpp/Ollama rule: positive logits / penalty, negative logits * penalty).
+    Sampler(float temperature, float top_p, uint64_t seed, float repeat_penalty = 1.0f, int repeat_last_n = 64)
+        : temp_(temperature), top_p_(top_p), rng_(seed), penalty_(repeat_penalty), last_n_(repeat_last_n) {}
 
     int sample(const float* logits) {
+        if (penalty_ != 1.0f && !recent_.empty()) {
+            pen_.assign(logits, logits + VOCAB);
+            for (int t : recent_) pen_[t] = pen_[t] > 0.0f ? pen_[t] / penalty_ : pen_[t] * penalty_;
+            logits = pen_.data();
+        }
+        const int tok = pick(logits);
+        if (penalty_ != 1.0f) {
+            recent_.push_back(tok);
+            if ((int)recent_.size() > last_n_) recent_.erase(recent_.begin());
+        }
+        return tok;
+    }
+
+private:
+    int pick(const float* logits) {
         if (temp_ <= 0.0f)   // greedy: used by the benchmark so runs are deterministic
             return (int)(std::max_element(logits, logits + VOCAB) - logits);
 
@@ -48,10 +65,13 @@ public:
         return cand_[last].id;
     }
 
-private:
     struct Cand { float p; int id; };
     float temp_, top_p_;
     std::mt19937_64 rng_;
+    float penalty_;
+    int last_n_;
+    std::vector<int> recent_;      // last sampled tokens (duplicates penalised once each time)
+    std::vector<float> pen_;
     std::vector<float> probs_;
     std::vector<Cand> cand_;
 };
