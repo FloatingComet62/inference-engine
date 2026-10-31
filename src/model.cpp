@@ -1,6 +1,7 @@
 #include <tuple>
 #include "model.hpp"
 #include "kernels.hpp"
+#include "kernels_attn.hpp"
 #include "threadpool.hpp"
 
 #include <cmath>
@@ -271,20 +272,8 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
                 const float* qh = q + (size_t)t * DIM + h * HEAD_DIM;
                 float* att = att_.data() + (size_t)idx * MAX_SEQ;
                 const int kvh = h / KV_MUL;
-                for (int p = 0; p <= pos; p++) {
-                    const float* kt = kcache + (size_t)p * KV_DIM + kvh * HEAD_DIM;
-                    float s = 0.0f;
-                    for (int i = 0; i < HEAD_DIM; i++) s += qh[i] * kt[i];
-                    att[p] = s * scale;
-                }
-                softmax(att, pos + 1);
-                float* out = xb + (size_t)t * DIM + h * HEAD_DIM;
-                std::memset(out, 0, HEAD_DIM * sizeof(float));
-                for (int p = 0; p <= pos; p++) {
-                    const float* vt = vcache + (size_t)p * KV_DIM + kvh * HEAD_DIM;
-                    const float a = att[p];
-                    for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
-                }
+                attend_head(xb + (size_t)t * DIM + h * HEAD_DIM, qh, kcache + kvh * HEAD_DIM,
+                            vcache + kvh * HEAD_DIM, KV_DIM, pos + 1, scale, att);
             }
         });
         mm(xb2, xb, L.wo, DIM, DIM, T);
