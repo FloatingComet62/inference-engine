@@ -32,27 +32,44 @@ namespace tl {
 constexpr int SPIN_PAUSE = 4000;    // busy-wait iterations before yielding the core
 constexpr int SPIN_YIELD = 20000;   // yields before sleeping on the condition variable
 
-// Logical CPUs with the highest max frequency, physical cores first, then siblings.
+// Parses a kernel CPU list such as "0-7,16-23".
+inline std::vector<int> parse_cpu_list(const std::string& s) {
+    std::vector<int> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        const std::string part = s.substr(i, j - i);
+        const size_t dash = part.find('-');
+        try {
+            const int a = std::stoi(part), b = dash == std::string::npos ? a : std::stoi(part.substr(dash + 1));
+            for (int c = a; c <= b; c++) out.push_back(c);
+        } catch (...) {}
+        i = j + 1;
+    }
+    return out;
+}
+
+// CPUs to pin to: the P-cores on hybrid Intel (kernel's /sys/devices/cpu_core list),
+// otherwise every online CPU; physical cores first, then their hyperthread siblings.
+// (Not "highest max frequency": favored-core turbo makes 1-2 cores report a higher max.)
 inline std::vector<int> fast_cpus() {
     std::vector<int> out;
 #ifdef __linux__
-    struct C { int cpu; long freq; bool primary; };
-    std::vector<C> cs;
-    for (int c = 0; c < 1024; c++) {
-        const std::string d = "/sys/devices/system/cpu/cpu" + std::to_string(c);
-        std::ifstream f(d + "/cpufreq/cpuinfo_max_freq"), sib(d + "/topology/thread_siblings_list");
-        long freq = 0;
-        int first = c;
-        if (!(f >> freq)) { if (c == 0) continue; break; }
-        sib >> first;   // list starts with the lowest sibling, e.g. "0-1" or "0,1"
-        cs.push_back({c, freq, first == c});
+    std::string list;
+    std::ifstream atom("/sys/devices/cpu_atom/cpus"), core("/sys/devices/cpu_core/cpus");
+    if (!(atom && core && std::getline(core, list))) {
+        std::ifstream online("/sys/devices/system/cpu/online");
+        std::getline(online, list);
     }
-    if (cs.empty()) return out;
-    long top = 0;
-    for (auto& c : cs) top = std::max(top, c.freq);
+    const std::vector<int> cpus = parse_cpu_list(list);
     for (int pass = 0; pass < 2; pass++)
-        for (auto& c : cs)
-            if (c.freq == top && c.primary == (pass == 0)) out.push_back(c.cpu);
+        for (int c : cpus) {
+            std::ifstream sib("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list");
+            int first = c;
+            sib >> first;   // list starts with the lowest sibling, e.g. "0-1" or "0,1"
+            if ((first == c) == (pass == 0)) out.push_back(c);
+        }
 #endif
     return out;
 }
@@ -154,12 +171,19 @@ struct Parallel {
     std::unique_ptr<ThreadPool> pool;
 };
 
-// Splits [0, count) into one contiguous chunk per thread and calls f(begin, end).
+// Calls f(begin, end) over [0, count) in small chunks that threads take from a shared
+// counter (ggml's scheme): faster cores simply take more chunks, so a slow core (an
+// E-core, a busy hyperthread, an unpinned thread) cannot hold up the whole barrier.
+// Each index is still processed by exactly one call, so results are unchanged.
+constexpr int CHUNKS_PER_THREAD = 4;
 template <class F> void parallel_for(int count, F&& f) {
     Parallel& P = Parallel::get();
-    auto chunk = [&](int tid, int nth) {
-        const int b = (int)((long long)count * tid / nth), e = (int)((long long)count * (tid + 1) / nth);
-        if (b < e) f(b, e);
+    std::atomic<int> next{0};
+    auto chunk = [&](int, int nth) {
+        int cs = count / (nth * CHUNKS_PER_THREAD);
+        if (cs < 1) cs = 1;
+        for (int b; (b = next.fetch_add(cs, std::memory_order_relaxed)) < count;)
+            f(b, b + cs < count ? b + cs : count);
     };
     if (P.pool) return P.pool->run(chunk);
 #ifdef _OPENMP
