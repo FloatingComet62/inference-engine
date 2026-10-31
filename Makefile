@@ -150,6 +150,13 @@ smoke:
 	        -t 0 -n 24 --ignore-eos -p "hello world" --prefill seq --pool omp 2>/dev/null | md5sum); \
 	    [ -n "$$a" ] && [ "$$a" = "$$b" ] || { echo "batched prefill / pool output differs ($$m)"; exit 1; }; \
 	done
+	@for p in "hello world" "the cat the cat the cat the cat"; do \
+	    a=$$(build-tiny/tinyllama run --model build-tiny/models/tinyllama-q4.bin --tokenizer build-tiny/models/tokenizer.bin \
+	        -t 0 -n 40 --ignore-eos -p "$$p" 2>/dev/null | md5sum); \
+	    b=$$(build-tiny/tinyllama run --model build-tiny/models/tinyllama-q4.bin --tokenizer build-tiny/models/tokenizer.bin \
+	        -t 0 -n 40 --ignore-eos -p "$$p" --spec ngram 2>/dev/null | md5sum); \
+	    [ -n "$$a" ] && [ "$$a" = "$$b" ] || { echo "speculative (ngram) output differs: $$p"; exit 1; }; \
+	done
 	@echo "smoke test passed"
 
 clean:

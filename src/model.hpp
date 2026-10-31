@@ -39,6 +39,11 @@ public:
     // (matrix x matrix); returns the logits of the last token.
     const float* prefill(const int* tokens, int n, int pos);
 
+    // Speculative verification: runs T tokens at positions pos..pos+T-1 in one batch
+    // (T <= PREFILL_CHUNK) and returns logits for ALL of them, [T][VOCAB]; row t
+    // predicts the token after tokens[t]. Rewinding pos later simply overwrites rows.
+    const float* forward_all(const int* tokens, int T, int pos) { return forward_batch(tokens, T, pos, true); }
+
     // Consults the cache for tokens[0..n) already stored for this sequence.
     // prefill() calls it at position 0 and skips the matched prefix entirely
     // (its KV rows are read back from the cache). Returns the matched length.
@@ -56,8 +61,8 @@ private:
     size_t file_size_ = 0;
     Weights w_{};
 
-    // T tokens at positions pos..pos+T-1; logits for the last one only.
-    const float* forward_batch(const int* tokens, int T, int pos);
+    // T tokens at positions pos..pos+T-1; logits for the last one only (or all T).
+    const float* forward_batch(const int* tokens, int T, int pos, bool all_logits = false);
     // out[T][n_out] = x[T][n_in] . W^T
     void mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T);
     std::vector<int8_t> xq_;   // quantised activations for mm()

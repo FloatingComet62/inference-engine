@@ -246,7 +246,7 @@ void Model::save_quantized(const std::string& path, WType mats, WType head) cons
     if (!f) throw std::runtime_error("write failed: " + path);
 }
 
-const float* Model::forward_batch(const int* tokens, int T, int pos0) {
+const float* Model::forward_batch(const int* tokens, int T, int pos0, bool all_logits) {
     float* x = x_.data();
     float* xb = xb_.data();
     float* xb2 = xb2_.data();
@@ -327,6 +327,12 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
     }
 
     work_valid_ = rebased ? 0 : n_ctx;
+    if (all_logits) {   // speculative verification: every row through the batched lm_head
+        if (logits_.size() < (size_t)T * VOCAB) logits_.resize((size_t)T * VOCAB);
+        for (int t = 0; t < T; t++) rmsnorm(x + (size_t)t * DIM, x + (size_t)t * DIM, w_.final_norm, DIM);
+        mm(logits_.data(), x, w_.lm_head, DIM, VOCAB, T);
+        return logits_.data();
+    }
     float* last = x + (size_t)(T - 1) * DIM;
     rmsnorm(last, last, w_.final_norm, DIM);
     mm(logits_.data(), last, w_.lm_head, DIM, VOCAB, 1);
