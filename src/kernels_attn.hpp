@@ -1,7 +1,9 @@
 // Attention kernels: one (token, head) of causal attention over the fp32 KV cache.
 #pragma once
 #include "config.hpp"
+#include "kernels_q4.hpp"   // dot_u8s8
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -102,6 +104,90 @@ inline void attend_head(float* __restrict out, const float* __restrict q,
         for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
     }
 #endif
+}
+
+// ---------------------------------------------------------------- int8 KV (--kv q8)
+// One KV head row (HEAD_DIM values) is stored as int8 with one fp32 scale: x ~= d * q.
+inline void quantize_head_q8(const float* x, int8_t* q, float* d) {
+    float amax = 0.0f;
+    for (int i = 0; i < HEAD_DIM; i++) amax = std::fmax(amax, std::fabs(x[i]));
+    const float s = amax / 127.0f, is = s ? 1.0f / s : 0.0f;
+    for (int i = 0; i < HEAD_DIM; i++) q[i] = (int8_t)std::lrintf(x[i] * is);
+    *d = s;
+}
+
+// Same contract as attend_head, with int8 K/V: k, v point at this head's row 0
+// (rows `stride` bytes apart), ks, vs at its scale for row 0 (`sstride` floats apart).
+// q is quantised to int8 once, q.k is an integer dot (u8 x s8 via the sign trick),
+// and values are accumulated as (p * v_scale) * int8 in fp32.
+inline void attend_head_q8(float* __restrict out, const float* __restrict q,
+                           const int8_t* k, const float* ks, const int8_t* v, const float* vs,
+                           size_t stride, size_t sstride, int n, float scale,
+                           float* __restrict att) {
+    int8_t qi[HEAD_DIM];
+    float qd;
+    quantize_head_q8(q, qi, &qd);
+    qd *= scale;
+    float mx = -INFINITY;
+#ifdef __AVX2__
+    if constexpr (HEAD_DIM == 64) {   // SIMD path: two 32-byte halves per row
+    const __m256i q0 = _mm256_loadu_si256((const __m256i*)qi);
+    const __m256i q1 = _mm256_loadu_si256((const __m256i*)(qi + 32));
+    const __m256i aq0 = _mm256_sign_epi8(q0, q0), aq1 = _mm256_sign_epi8(q1, q1);   // |q| as u8
+    for (int p = 0; p < n; p++) {
+        const int8_t* kt = k + p * stride;
+        const __m256i k0 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)kt), q0);
+        const __m256i k1 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(kt + 32)), q1);
+        const __m256i acc = dot_u8s8(aq1, k1, dot_u8s8(aq0, k0));
+        __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+        s4 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 1));
+        const float s = (float)_mm_cvtsi128_si32(s4) * qd * ks[p * sstride];
+        att[p] = s;
+        mx = s > mx ? s : mx;
+    }
+    const __m256 vmax = _mm256_set1_ps(mx);
+    __m256 vsum = _mm256_setzero_ps();
+    int p = 0;
+    for (; p + 8 <= n; p += 8) {
+        __m256 e = exp256(_mm256_sub_ps(_mm256_loadu_ps(att + p), vmax));
+        _mm256_storeu_ps(att + p, e);
+        vsum = _mm256_add_ps(vsum, e);
+    }
+    float sum = hsum256(vsum);
+    for (; p < n; p++) { att[p] = std::exp(att[p] - mx); sum += att[p]; }
+    constexpr int NV = HEAD_DIM / 8;
+    __m256 o[NV];
+    for (int j = 0; j < NV; j++) o[j] = _mm256_setzero_ps();
+    for (p = 0; p < n; p++) {
+        const int8_t* vt = v + p * stride;
+        const __m256 a = _mm256_set1_ps(att[p] * vs[p * sstride]);
+        for (int j = 0; j < NV; j++) {
+            const __m256 x = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(vt + 8 * j))));
+            o[j] = _mm256_fmadd_ps(a, x, o[j]);
+        }
+    }
+    const __m256 inv = _mm256_set1_ps(1.0f / sum);
+    for (int j = 0; j < NV; j++) _mm256_storeu_ps(out + 8 * j, _mm256_mul_ps(o[j], inv));
+    return;
+    }
+#endif
+    for (int p = 0; p < n; p++) {
+        const int8_t* kt = k + p * stride;
+        int32_t s = 0;
+        for (int i = 0; i < HEAD_DIM; i++) s += qi[i] * kt[i];
+        att[p] = (float)s * qd * ks[p * sstride];
+        mx = att[p] > mx ? att[p] : mx;
+    }
+    float sum = 0.0f;
+    for (int p = 0; p < n; p++) { att[p] = std::exp(att[p] - mx); sum += att[p]; }
+    const float inv = 1.0f / sum;
+    std::memset(out, 0, HEAD_DIM * sizeof(float));
+    for (int p = 0; p < n; p++) {
+        const int8_t* vt = v + p * stride;
+        const float a = att[p] * vs[p * sstride] * inv;
+        for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
+    }
 }
 
 }  // namespace tl

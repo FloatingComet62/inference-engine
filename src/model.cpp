@@ -31,7 +31,7 @@ inline void rope(float* v, const float* cs, const float* sn) {
 }
 }  // namespace
 
-Model::Model(const std::string& path, KVCache& cache) : cache_(&cache) {
+Model::Model(const std::string& path, KVCache& cache, bool kv_q8) : kv_q8_(kv_q8), cache_(&cache) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open weights: " + path + " (run `make setup`)");
     struct stat st{};
@@ -96,8 +96,15 @@ Model::Model(const std::string& path, KVCache& cache) : cache_(&cache) {
     att_.resize(T * N_HEADS * MAX_SEQ);
     hb_.resize(T * HIDDEN); hb2_.resize(T * HIDDEN); logits_.resize(VOCAB);
     k_tmp_.resize(T * KV_DIM); v_tmp_.resize(T * KV_DIM);
-    k_rot_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
-    v_work_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    if (kv_q8_) {
+        k8_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+        v8_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+        ks_.resize((size_t)N_LAYERS * MAX_SEQ * N_KV_HEADS);
+        vs_.resize((size_t)N_LAYERS * MAX_SEQ * N_KV_HEADS);
+    } else {
+        k_rot_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+        v_work_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    }
     seq_ = cache_->begin_sequence();
 
     constexpr int half = HEAD_DIM / 2;
@@ -272,8 +279,12 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
     int n_ctx = 0;   // slots the newest token attends to
     for (int l = 0; l < N_LAYERS; l++) {
         const LayerWeights& L = w_.layers[l];
-        float* kw = k_rot_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        float* vw = v_work_.data() + (size_t)l * MAX_SEQ * KV_DIM;
+        float* kw = kv_q8_ ? nullptr : k_rot_.data() + (size_t)l * MAX_SEQ * KV_DIM;
+        float* vw = kv_q8_ ? nullptr : v_work_.data() + (size_t)l * MAX_SEQ * KV_DIM;
+        int8_t* k8 = kv_q8_ ? k8_.data() + (size_t)l * MAX_SEQ * KV_DIM : nullptr;
+        int8_t* v8 = kv_q8_ ? v8_.data() + (size_t)l * MAX_SEQ * KV_DIM : nullptr;
+        float* ks = kv_q8_ ? ks_.data() + (size_t)l * MAX_SEQ * N_KV_HEADS : nullptr;
+        float* vs = kv_q8_ ? vs_.data() + (size_t)l * MAX_SEQ * N_KV_HEADS : nullptr;
 
         // ---- attention ----
         for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.attn_norm, DIM);
@@ -293,7 +304,19 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
         // Bring the working copy up to date: only slots not yet copied.
         const int stored = cache_->stored_tokens(seq_);
         n_ctx = stored < pos0 + T ? stored : pos0 + T;
-        for (int sl = work_valid_; sl < n_ctx; sl++) {
+        for (int sl = work_valid_; sl < n_ctx && kv_q8_; sl++) {
+            // rotate in a scratch row, then quantise each head row to int8
+            float kr[KV_DIM];
+            std::memcpy(kr, cache_->key_row(seq_, l, sl), KV_DIM * sizeof(float));
+            const float* vr = cache_->value_row(seq_, l, sl);
+            const size_t o = (size_t)sl * KV_DIM, so = (size_t)sl * N_KV_HEADS;
+            for (int h = 0; h < N_KV_HEADS; h++) {
+                rope(kr + h * HEAD_DIM, &rope_cos_[(size_t)sl * half], &rope_sin_[(size_t)sl * half]);
+                quantize_head_q8(kr + h * HEAD_DIM, k8 + o + h * HEAD_DIM, ks + so + h);
+                quantize_head_q8(vr + h * HEAD_DIM, v8 + o + h * HEAD_DIM, vs + so + h);
+            }
+        }
+        for (int sl = work_valid_; sl < n_ctx && !kv_q8_; sl++) {
             float* kr = kw + (size_t)sl * KV_DIM;
             std::memcpy(kr, cache_->key_row(seq_, l, sl), KV_DIM * sizeof(float));
             std::memcpy(vw + (size_t)sl * KV_DIM, cache_->value_row(seq_, l, sl), KV_DIM * sizeof(float));
@@ -307,6 +330,12 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
                 const int t = idx / N_HEADS, h = idx % N_HEADS;
                 const int n = rebased ? n_ctx : pos0 + t + 1;
                 const int kvh = h / KV_MUL;
+                if (kv_q8_) {
+                    attend_head_q8(xb + (size_t)t * DIM + h * HEAD_DIM, q + (size_t)t * DIM + h * HEAD_DIM,
+                                   k8 + kvh * HEAD_DIM, ks + kvh, v8 + kvh * HEAD_DIM, vs + kvh,
+                                   KV_DIM, N_KV_HEADS, n, scale, att_.data() + (size_t)idx * MAX_SEQ);
+                    continue;
+                }
                 attend_head(xb + (size_t)t * DIM + h * HEAD_DIM, q + (size_t)t * DIM + h * HEAD_DIM,
                             kw + kvh * HEAD_DIM, vw + kvh * HEAD_DIM, KV_DIM, n, scale,
                             att_.data() + (size_t)idx * MAX_SEQ);
