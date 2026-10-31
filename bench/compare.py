@@ -355,7 +355,8 @@ def main():
     RESULTS.mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     commit = git_commit()
-    record = {"time": stamp, "commit": commit, "threads": a.threads, "n": a.n, "bandwidth_gbps": gbps, "quality": qual,
+    record = {"time": stamp, "commit": commit, "suite": "compare", "model": Path(a.model).name,
+              "engine_args": a.engine_args, "threads": a.threads, "n": a.n, "bandwidth_gbps": gbps, "quality": qual,
               "results": {name: {"median": m, "model_bytes": nb, "runs": r} for name, m, nb, r in rows}}
     (RESULTS / f"{stamp}.json").write_text(json.dumps(record, indent=2))
     hist = RESULTS / "history.csv"

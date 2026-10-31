@@ -16,6 +16,8 @@ Add a row whenever you try something; keep the losers, they are results too.
 | Quality vs fp32 (WikiText-2) | `make eval WTYPE=q4a` |
 | Chat UI with both engines | `make serve WTYPE=q4a ENGINE_FLAGS="--kv q8"` + `make ollama-serve` + `make webui` (via uv, first run downloads ~1 GB) -> http://localhost:3000 |
 | Sanity check after any change | `make smoke` |
+| Benchmark dashboard (all runs, charts, this log) | `make serve`, then http://localhost:8000/dashboard |
+| Both models side by side in Open WebUI | click **+** next to the model name, add `tinyllama-cpp` and `tinyllama:1.1b`; the (i) under each reply shows tok/s |
 
 `WTYPE=q4a` is built once from fp32 (~100 s, `make model WTYPE=q4a`). Before benchmarking:
 plug in, set the performance profile, close other heavy apps, keep Ollama idle.
@@ -59,6 +61,9 @@ do not repeat text; see P5 below for where it pays.
 | 19 | **P4** `--kv q8` int8 KV working copy, integer q.k | ~1.7k ctx: prefill +13%, decode +13%, -65 MB RAM; no ppl loss (469-token test) | yes (opt-in) |
 | 20 | **P5** `--spec ngram` prompt-lookup speculative decoding, greedy | repeat/summarise prompt: 2.0x decode (57 -> 116 tok/s, 83% acceptance); normal prompts neutral; output byte-identical | yes (opt-in) |
 | 21 | OpenAI-compatible API (`make serve`) + Open WebUI (`make webui`) | chat UI against both engines | yes |
+| 22 | Repetition penalty (`--repeat-penalty`, Ollama's 1.1 in the chat API) + stop strings (`--stop`, Ollama's TinyLlama stops) | fixes greedy loops and the model writing both sides of a dialogue; benchmarks unchanged (penalty off there) | yes |
+| 23 | Chat API temperature default 0.3 (both models set to 0.3 in Open WebUI) | at 0.8 TinyLlama rambles/role-plays; 0.3 gives focused answers | yes |
+| 24 | Dashboard (`/dashboard`) + per-reply speed stats in Open WebUI | results now record suite, model and flags | yes |
 
 ## Things we learned
 
@@ -84,4 +89,7 @@ do not repeat text; see P5 below for where it pays.
   WebUI open Workspace -> Models -> edit the model -> Advanced Params -> Function Calling = **Legacy**,
   and untick the **Builtin Tools** capability. Do the same for `tinyllama-cpp`. Then start a new chat.
   The setting is stored in `~/.open-webui`, so it survives restarts.
+- Both TinyLlama models are set to temperature 0.3 in Open WebUI (Workspace -> Models) so the
+  side-by-side comparison is fair. Two models answering at once share the CPU, so compare tok/s
+  from single-model chats or `make compare`, not from a side-by-side chat.
 - Open WebUI writes `.webui_secret_key` into the directory it starts from; it is git-ignored.

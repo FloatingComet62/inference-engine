@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine Benchmarks</title>
+<style>
+:root {
+  --bg: #f7f7f5; --card: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e3e3e0;
+  --ours: #2f6fde; --ollama: #d9822b; --good: #1f8a4c; --bad: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151517; --card: #1e1e21; --text: #ececee; --muted: #9a9aa2; --line: #2e2e33;
+          --ours: #6b9cff; --ollama: #f0a35e; --good: #4cc27f; --bad: #ef6b5d; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 17px; margin: 32px 0 10px; }
+h3 { font-size: 15px; margin: 22px 0 8px; }
+.sub { color: var(--muted); margin: 0 0 20px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card .k { color: var(--muted); font-size: 12px; } .card .v { font-size: 20px; font-weight: 600; }
+.card .cmp { font-size: 12px; } .win { color: var(--good); } .lose { color: var(--bad); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; color: var(--muted); }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+.chart { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.chart svg { width: 100%; height: 190px; display: block; }
+.scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.ollama td { color: var(--muted); }
+.md table { margin: 8px 0; } .md td, .md th { white-space: normal; vertical-align: top; }
+.md code { background: var(--line); padding: 1px 4px; border-radius: 4px; font-size: 12px; }
+.filters { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 10px; }
+select { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>tinyllama-cpp vs Ollama</h1>
+  <p class="sub">Every <code>make compare</code> / <code>compare-longer</code> run on this machine, newest first. Higher is
+    better for tok/s; lower is better for TTFT, RAM and energy.</p>
+
+  <h2 id="latest-title">Latest run</h2>
+  <div class="cards" id="cards"></div>
+
+  <h2>History</h2>
+  <div class="legend"><span><i class="dot" style="background:var(--ours)"></i>tinyllama-cpp</span>
+    <span><i class="dot" style="background:var(--ollama)"></i>Ollama</span></div>
+  <div class="charts" id="charts"></div>
+  <p class="note">Each point is one benchmark run (median of its repeats). Early points are the fp32 baseline and
+    runs taken in power-saving mode; see the table for each run's configuration.</p>
+
+  <h2>All runs</h2>
+  <div class="filters">
+    <label>Suite <select id="f-suite"></select></label>
+    <label>Model <select id="f-model"></select></label>
+  </div>
+  <div class="scroll"><table id="runs"></table></div>
+
+  <h2>Experiment log</h2>
+  <div class="md" id="experiments">Loading…</div>
+</main>
+<script>
+const OURS = "tinyllama-cpp";
+const fmt = (v, d = 1) => v == null || isNaN(v) ? "–" : Number(v).toFixed(d);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+// Older result files did not record the model; infer it from the bytes read per token.
+function modelOf(run) {
+  if (run.model) return run.model.replace("tinyllama-", "").replace(".bin", "");
+  const b = run.results?.[OURS]?.model_bytes;
+  if (!b) return "unlabelled";
+  return b > 2e9 ? "f32 (inferred)" : "q4 (inferred)";
+}
+const suiteOf = run => run.suite || "compare";
+const ollamaKey = run => Object.keys(run.results || {}).find(k => k.startsWith("ollama"));
+const label = run => `${run.time.slice(4, 6)}/${run.time.slice(6, 8)} ${run.time.slice(9, 11)}:${run.time.slice(11, 13)}`;
+
+function cards(run) {
+  const o = run.results[OURS]?.median, ok = ollamaKey(run), l = ok ? run.results[ok].median : null;
+  document.getElementById("latest-title").textContent =
+    `Latest run · ${label(run)} · ${suiteOf(run)} · ${modelOf(run)} ${run.engine_args || ""} · ${run.threads} threads`;
+  const metrics = [
+    ["Decode tok/s", "decode_tps", 1, true], ["Prefill tok/s", "prefill_tps", 1, true],
+    ["Time to first token ms", "ttft_ms", 0, false], ["Peak RAM MB", "peak_rss_mb", 0, false],
+    ["Energy J/token", "j_per_tok", 2, false],
+  ];
+  let html = "";
+  for (const [name, key, d, higher] of metrics) {
+    if (!o) break;
+    const a = o[key], b = l?.[key];
+    let cmp = "";
+    if (a != null && b != null && b !== 0) {
+      const r = higher ? a / b : b / a, win = r >= 1;
+      cmp = `<div class="cmp ${win ? "win" : "lose"}">${win ? "" : ""}${fmt(r, 2)}× ${win ? "better" : "worse"} than Ollama (${fmt(b, d)})</div>`;
+    }
+    html += `<div class="card"><div class="k">${name}</div><div class="v">${fmt(a, d)}</div>${cmp}</div>`;
+  }
+  const q = run.quality;
+  if (q) html += `<div class="card"><div class="k">Quality vs fp32</div><div class="v">${q.ppl_delta_pct >= 0 ? "+" : ""}${fmt(q.ppl_delta_pct, 2)}%</div>
+    <div class="cmp">ppl ${fmt(q.ppl, 3)} · top-1 agree ${fmt(q.top1_agree_pct, 1)}%</div></div>`;
+  document.getElementById("cards").innerHTML = html;
+}
+
+function chart(runs, key, title) {
+  const W = 520, H = 190, P = {l: 40, r: 10, t: 22, b: 22};
+  const pts = runs.map((r, i) => ({i, a: r.results[OURS]?.median?.[key], b: r.results[ollamaKey(r)]?.median?.[key], r}));
+  const vals = pts.flatMap(p => [p.a, p.b]).filter(v => v != null && isFinite(v));
+  if (!vals.length) return "";
+  const max = Math.max(...vals) * 1.1, n = Math.max(pts.length - 1, 1);
+  const x = i => P.l + (W - P.l - P.r) * i / n, y = v => H - P.b - (H - P.t - P.b) * v / max;
+  const line = (k, color) => {
+    const ps = pts.filter(p => p[k] != null);
+    const d = ps.map((p, j) => `${j ? "L" : "M"}${x(p.i).toFixed(1)},${y(p[k]).toFixed(1)}`).join("");
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.5" opacity=".55"/>` +
+      ps.map(p => `<circle cx="${x(p.i)}" cy="${y(p[k])}" r="3" fill="${color}"><title>${label(p.r)} · ${modelOf(p.r)} ${esc(p.r.engine_args || "")}: ${fmt(p[k])}</title></circle>`).join("");
+  };
+  const ticks = [0, .5, 1].map(f => `<text x="${P.l - 6}" y="${y(max * f / 1.1) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${fmt(max * f / 1.1, 0)}</text>
+    <line x1="${P.l}" x2="${W - P.r}" y1="${y(max * f / 1.1)}" y2="${y(max * f / 1.1)}" stroke="var(--line)"/>`).join("");
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${title}">
+    <text x="${P.l}" y="14" font-size="12" font-weight="600" fill="var(--text)">${title}</text>${ticks}
+    ${line("b", "var(--ollama)")}${line("a", "var(--ours)")}</svg></div>`;
+}
+
+function table(runs) {
+  const head = ["Run", "Suite", "Model / flags", "Engine", "Prefill tok/s", "Decode tok/s", "TTFT ms", "RAM MB",
+                "J/token", "Read GB/s", "ppl vs fp32"];
+  let rows = "";
+  for (const r of runs) {
+    const engines = [OURS, ollamaKey(r)].filter(k => k && r.results[k]);
+    engines.forEach((k, j) => {
+      const m = r.results[k].median, gb = m.decode_tps * r.results[k].model_bytes / 1e9;
+      const q = j === 0 && r.quality ? `${r.quality.ppl_delta_pct >= 0 ? "+" : ""}${fmt(r.quality.ppl_delta_pct, 2)}%` : "";
+      rows += `<tr class="${k === OURS ? "" : "ollama"}">
+        <td>${j === 0 ? label(r) : ""}</td><td>${j === 0 ? suiteOf(r) : ""}</td>
+        <td>${j === 0 ? esc(modelOf(r) + " " + (r.engine_args || "")) : ""}</td><td>${esc(k)}</td>
+        <td class="num">${fmt(m.prefill_tps)}</td><td class="num">${fmt(m.decode_tps, 2)}</td>
+        <td class="num">${fmt(m.ttft_ms, 0)}</td><td class="num">${fmt(m.peak_rss_mb, 0)}</td>
+        <td class="num">${fmt(m.j_per_tok, 2)}</td><td class="num">${fmt(gb)}</td><td class="num">${q}</td></tr>`;
+    });
+  }
+  document.getElementById("runs").innerHTML = `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
+}
+
+// Tiny markdown renderer: headings, tables, lists, paragraphs, `code`, **bold**.
+function markdown(src) {
+  const inline = s => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  const lines = src.split("\n"), out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^#{1,3} /.test(l)) { const n = l.match(/^#+/)[0].length; out.push(`<h${n + 1}>${inline(l.slice(n + 1))}</h${n + 1}>`); }
+    else if (l.startsWith("|")) {
+      const rows = [];
+      while (i < lines.length && lines[i].startsWith("|")) rows.push(lines[i++]);
+      i--;
+      const cells = r => r.split("|").slice(1, -1).map(c => c.trim());
+      const body = rows.slice(2).map(r => `<tr>${cells(r).map(c => `<td>${inline(c)}</td>`).join("")}</tr>`).join("");
+      out.push(`<div class="scroll"><table><thead><tr>${cells(rows[0]).map(c => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`);
+    } else if (/^- /.test(l)) {
+      const items = [];
+      while (i < lines.length && /^(- |  )/.test(lines[i])) {
+        if (lines[i].startsWith("- ")) items.push(lines[i].slice(2)); else items[items.length - 1] += " " + lines[i].trim();
+        i++;
+      }
+      i--;
+      out.push(`<ul>${items.map(t => `<li>${inline(t)}</li>`).join("")}</ul>`);
+    } else if (l.trim()) {
+      let p = l;
+      while (i + 1 < lines.length && lines[i + 1].trim() && !/^(#|\||- )/.test(lines[i + 1])) p += " " + lines[++i];
+      out.push(`<p>${inline(p)}</p>`);
+    }
+  }
+  return out.join("");
+}
+
+async function main() {
+  const runs = (await (await fetch("/api/results")).json()).filter(r => r.results?.[OURS] || ollamaKey(r));
+  runs.sort((a, b) => a.time.localeCompare(b.time));
+  if (runs.length) cards(runs[runs.length - 1]);
+  document.getElementById("charts").innerHTML =
+    chart(runs, "decode_tps", "Decode tok/s") + chart(runs, "prefill_tps", "Prefill tok/s") +
+    chart(runs, "ttft_ms", "Time to first token (ms)") + chart(runs, "j_per_tok", "Energy (J/token)");
+
+  const pick = (id, vals) => {
+    const el = document.getElementById(id);
+    el.innerHTML = `<option value="">all</option>` + [...new Set(vals)].map(v => `<option>${esc(v)}</option>`).join("");
+    el.onchange = render;
+  };
+  pick("f-suite", runs.map(suiteOf));
+  pick("f-model", runs.map(modelOf));
+  function render() {
+    const s = document.getElementById("f-suite").value, m = document.getElementById("f-model").value;
+    table(runs.filter(r => (!s || suiteOf(r) === s) && (!m || modelOf(r) === m)).reverse());
+  }
+  render();
+  document.getElementById("experiments").innerHTML = markdown(await (await fetch("/api/experiments")).text());
+}
+main().catch(e => { document.getElementById("cards").textContent = "Could not load results: " + e; });
+</script>
+</body>
+</html>
