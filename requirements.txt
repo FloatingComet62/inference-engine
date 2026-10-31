@@ -1,0 +1,2 @@
+# Python tooling uses the standard library only (no torch/numpy).
+# Kept so `make venv` has a single place to add tools later.

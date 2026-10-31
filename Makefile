@@ -12,6 +12,9 @@ TEMP         ?= 0.7
 PROMPT       ?= Explain how a CPU cache works, in simple terms.
 OLLAMA_MODEL ?= tinyllama:1.1b
 OLLAMA_URL   ?= http://localhost:11434
+QUALITY      ?= 1
+VENV         ?= .venv
+PY           := $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 
 BIN         := $(BUILD)/tinyllama
 WEIGHTS     := $(MODELS)/tinyllama-f32.bin
@@ -19,10 +22,10 @@ TOKENIZER   := $(MODELS)/tokenizer.bin
 ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
-               --bandwidth-bin $(BUILD)/bandwidth
+               --bandwidth-bin $(BUILD)/bandwidth $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -34,6 +37,9 @@ help:
 	@echo "  make compare       benchmark this engine vs Ollama tinyllama:1.1b"
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
+	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make venv          create the Python virtual environment in .venv"
+	@echo "  make rapl-perms    allow reading CPU energy counters (sudo, until reboot)"
 	@echo "  make smoke         30-second pipeline test with a toy model (no download)"
 	@echo "  make debug         debug build with sanitizers (then: make run BUILD=build-debug)"
 	@echo ""
@@ -41,7 +47,21 @@ help:
 	@echo "  make ollama-pull   download tinyllama:1.1b into Ollama"
 	@echo "  make ollama-run    chat with Ollama's tinyllama for a side-by-side feel"
 
-setup: deps build model
+setup: deps venv build model
+
+venv: $(VENV)/.installed
+
+$(VENV)/.installed: requirements.txt
+	python3 -m venv $(VENV)
+	$(VENV)/bin/python -m pip install -q -r requirements.txt
+	@touch $@
+
+rapl-perms:
+	sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
+
+ppl: build model
+	@$(BIN) ppl --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
+	    --text bench/data/eval.txt --max-tokens 512 --ctx 256 | cut -c1-200
 
 deps:
 	@scripts/check_deps.sh
@@ -60,7 +80,7 @@ $(MODELS)/model.safetensors:
 	@scripts/download.sh $(MODELS)
 
 $(WEIGHTS): $(MODELS)/model.safetensors scripts/convert.py
-	@python3 scripts/convert.py --model-dir $(MODELS) --out-dir $(MODELS)
+	@$(PY) scripts/convert.py --model-dir $(MODELS) --out-dir $(MODELS)
 
 $(TOKENIZER): $(WEIGHTS)
 
@@ -71,13 +91,13 @@ chat: build model
 	@$(BIN) chat $(ENGINE_ARGS) -t $(TEMP) -n 512
 
 bench: build model
-	@python3 bench/compare.py $(BENCH_ARGS) --only engine
+	@$(PY) bench/compare.py $(BENCH_ARGS) --only engine
 
 bench-ollama:
-	@python3 bench/compare.py $(BENCH_ARGS) --only ollama
+	@$(PY) bench/compare.py $(BENCH_ARGS) --only ollama
 
 compare: build model
-	@python3 bench/compare.py $(BENCH_ARGS) --only both
+	@$(PY) bench/compare.py $(BENCH_ARGS) --only both
 
 bandwidth: build
 	@OMP_NUM_THREADS=$(THREADS) $(BUILD)/bandwidth
@@ -94,10 +114,12 @@ ollama-run:
 smoke:
 	@cmake -S . -B build-tiny -DCMAKE_BUILD_TYPE=Release -DTL_TINY_TEST=ON > /dev/null
 	@cmake --build build-tiny -j
-	@python3 tests/make_tiny_model.py build-tiny/models
-	@python3 scripts/convert.py --model-dir build-tiny/models --out-dir build-tiny/models
+	@$(PY) tests/make_tiny_model.py build-tiny/models
+	@$(PY) scripts/convert.py --model-dir build-tiny/models --out-dir build-tiny/models
 	@build-tiny/tinyllama bench --model build-tiny/models/tinyllama-f32.bin \
 	    --tokenizer build-tiny/models/tokenizer.bin -p "hello world" -n 16 --ignore-eos
+	@build-tiny/tinyllama ppl --model build-tiny/models/tinyllama-f32.bin \
+	    --tokenizer build-tiny/models/tokenizer.bin --text bench/data/eval.txt --max-tokens 64 --ctx 32 | cut -c1-80
 	@echo "smoke test passed"
 
 clean:
