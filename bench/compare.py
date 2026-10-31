@@ -25,7 +25,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Each run gets a unique tag at the very start of the system prompt, so Ollama's
+# server-side prompt cache cannot reuse KV from earlier runs or earlier sessions.
 SYSTEM = "You are a helpful AI assistant."
+RUN_ID = os.urandom(4).hex()
+_run_counter = 0
+
+
+def tagged_system():
+    global _run_counter
+    _run_counter += 1
+    return f"[session {RUN_ID}-{_run_counter}] {SYSTEM}"
 PROMPTS = [
     "Explain how a CPU cache works, in simple terms.",
     "Write a short story about a robot who learns to paint.",
@@ -122,14 +132,14 @@ def peak_rss_mb(pids):
     return best
 
 
-def chat_template(user):
-    return f"<|system|>\n{SYSTEM}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n"
+def chat_template(system, user):
+    return f"<|system|>\n{system}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n"
 
 
 # ---------------------------------------------------------------- our engine
 def run_engine(a, user):
     cmd = [a.bin, "bench", "--model", a.model, "--tokenizer", a.tokenizer,
-           "-p", user, "--system", SYSTEM, "-n", str(a.n), "--threads", str(a.threads)]
+           "-p", user, "--system", tagged_system(), "-n", str(a.n), "--threads", str(a.threads)]
     with Energy() as e:
         p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -164,7 +174,7 @@ def run_ollama(a, user):
     with Energy() as e:
         r = http(f"{a.ollama_url}/api/generate", {
         "model": a.ollama_model,
-        "prompt": chat_template(user),
+        "prompt": chat_template(tagged_system(), user),
         "raw": True,
         "stream": False,
         "options": {"temperature": 0, "seed": 42, "num_predict": a.n,
@@ -285,7 +295,8 @@ def main():
     print(f"benchmark: {a.runs} runs, up to {a.n} new tokens, {a.threads} threads, greedy")
     gbps = measure_bandwidth(a)
     if gbps:
-        print(f"  memory read bandwidth: {gbps:.1f} GB/s")
+        print(f"  memory read probe: {gbps:.1f} GB/s (pure read loop; on laptops in powersave it can read"
+              f" below what a real workload sustains, so it is shown for reference only)")
     if not rapl_domains():
         print("  energy: RAPL not readable, skipped (run: make rapl-perms)")
 
@@ -311,8 +322,7 @@ def main():
             ("model MB", lambda m, nb: fmt(nb / 1e6, ".0f")),
             ("CPU %", lambda m, nb: fmt(m["cpu_util_pct"], ".0f")),
             ("J/token", lambda m, nb: fmt(m["j_per_tok"], ".2f"))]
-    if gbps:
-        cols.append(("% BW limit", lambda m, nb: fmt(100 * m["decode_tps"] * nb / (gbps * 1e9) if nb else None, ".0f")))
+    cols.append(("read GB/s", lambda m, nb: fmt(m["decode_tps"] * nb / 1e9 if nb else None, ".1f")))
     print()
     hdr = f"{'engine':<24}" + "".join(f"{c:>14}" for c, _ in cols)
     print(hdr)
@@ -329,8 +339,7 @@ def main():
     print(f"CPU % = CPU time / wall time, 100% per busy core ({a.threads} threads -> max {100 * a.threads}%)")
     print("TTFT  = prompt in -> first token (Ollama: + its model load time)")
     print("peak RAM includes mmap'd weight pages (engine) / runner lifetime peak (Ollama)")
-    if gbps:
-        print("% BW limit = decode tok/s divided by (bandwidth / bytes read per token)")
+    print("read GB/s = decode tok/s x weight bytes per token (effective memory bandwidth used by decode)")
 
     RESULTS.mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
