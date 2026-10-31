@@ -1,3 +1,4 @@
+#include <tuple>
 #include "model.hpp"
 #include "kernels.hpp"
 #include "threadpool.hpp"
@@ -88,6 +89,7 @@ Model::Model(const std::string& path) {
     constexpr size_t T = PREFILL_CHUNK;
     xq_.resize(T * HIDDEN);
     xd_.resize(xq_.size() / QK);
+    xs_.resize(xd_.size() * 8);
 
     x_.resize(T * DIM); xb_.resize(T * DIM); xb2_.resize(T * DIM); q_.resize(T * DIM);
     att_.resize(T * N_HEADS * MAX_SEQ);
@@ -114,6 +116,9 @@ size_t Model::bytes_per_token() const {
     return file_size_ - HEADER_BYTES - (size_t)VOCAB * DIM * sizeof(float) + DIM * sizeof(float);
 }
 
+// prefill register tile: 2 rows x 4 tokens measured best (2x4, 3x4, 4x4 within noise; 4x2 slower)
+static constexpr int TR = 2, TC = 4;
+
 void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T) {
     if (m.t == WType::F32) {
         const float* W = static_cast<const float*>(m.w);
@@ -127,29 +132,41 @@ void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, in
     const int nb = n_in / QK;
     int8_t* xq = xq_.data();
     float* xd = xd_.data();
+    int32_t* xs = xs_.data();
     auto quant = [&](int b, int e) {
-        for (int t = b; t < e; t++) quantize_act(x + (size_t)t * n_in, xq + (size_t)t * n_in, xd + t * nb, n_in);
+        for (int t = b; t < e; t++)
+            quantize_act(x + (size_t)t * n_in, xq + (size_t)t * n_in, xd + t * nb, n_in, xs + (size_t)t * nb * 8);
     };
     if (T == 1) quant(0, 1); else parallel_for(T, quant);
     if (T == 1) {   // decode: one dot product per row
         parallel_for(n_out, [&](int b, int e) {
             for (int i = b; i < e; i++)
-                out[i] = m.t == WType::Q4 ? dot_q4(static_cast<const BlockQ4*>(m.w) + (size_t)i * nb, xq, xd, nb)
+                out[i] = m.t == WType::Q4 ? dot_q4(static_cast<const BlockQ4*>(m.w) + (size_t)i * nb, xq, xd, xs, nb)
                                           : dot_q8(static_cast<const BlockQ8*>(m.w) + (size_t)i * nb, xq, xd, nb);
         });
         return;
     }
-    // prefill: each weight row is unpacked once per 4 tokens and stays in L1 for all T
+    // prefill: TR rows x TC tokens register tiles; remainders use narrower tiles
     auto rows = [&](auto* W) {
-        parallel_for(n_out, [&](int b, int e) {
-            for (int i = b; i < e; i++) {
-                const auto* row = W + (size_t)i * nb;
-                int t = 0;
-                for (; t + 8 <= T; t += 8)
-                    dot_rows_n<8>(row, xq + (size_t)t * n_in, xd + t * nb, nb, out + (size_t)t * n_out + i, n_out);
-                for (; t < T; t++)
-                    dot_rows_n<1>(row, xq + (size_t)t * n_in, xd + t * nb, nb, out + (size_t)t * n_out + i, n_out);
+        auto col = [&](auto R, int i) {   // R rows starting at i, all tokens
+            constexpr int r = decltype(R)::value;
+            const auto* row = W + (size_t)i * nb;
+            int t = 0;
+            auto at = [&](int t) { return std::make_tuple(xq + (size_t)t * n_in, xd + t * nb, xs + (size_t)t * nb * 8,
+                                                         out + (size_t)t * n_out + i); };
+            for (; t + TC <= T; t += TC) {
+                auto [a, d, c, o] = at(t);
+                dot_tile<r, TC>(row, a, d, c, nb, o, n_out);
             }
+            for (; t < T; t++) {
+                auto [a, d, c, o] = at(t);
+                dot_tile<r, 1>(row, a, d, c, nb, o, n_out);
+            }
+        };
+        parallel_for(n_out, [&](int b, int e) {
+            int i = b;
+            for (; i + TR <= e; i += TR) col(std::integral_constant<int, TR>{}, i);
+            for (; i < e; i++) col(std::integral_constant<int, 1>{}, i);
         });
     };
     if (m.t == WType::Q4) rows(static_cast<const BlockQ4*>(m.w));

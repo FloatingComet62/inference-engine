@@ -54,6 +54,7 @@ private:
     void mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T);
     std::vector<int8_t> xq_;   // quantised activations for mm()
     std::vector<float> xd_;
+    std::vector<int32_t> xs_;  // per-block Q4 zero-point correction (-8 * group sums)
 
     std::vector<float> x_, xb_, xb2_, q_, att_, hb_, hb2_, logits_;
     std::vector<float> key_cache_, value_cache_;   // [N_LAYERS][MAX_SEQ][KV_DIM]
