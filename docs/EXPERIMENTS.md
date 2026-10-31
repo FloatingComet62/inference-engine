@@ -77,3 +77,11 @@ do not repeat text; see P5 below for where it pays.
 - Validate `--kv q8` on 2,048-token WikiText chunks, then make `q4a` + `--kv q8` the defaults.
 - Re-run on the teammate's i9 after `git pull` (fusion + thread defaults).
 - P2 tuner: require a >3% win in two sweeps before leaving the default; run on an idle machine.
+
+## Open WebUI notes
+
+- If an Ollama model fails with "does not support tools" (TinyLlama has no tool calling): in Open
+  WebUI open Workspace -> Models -> edit the model -> Advanced Params -> Function Calling = **Legacy**,
+  and untick the **Builtin Tools** capability. Do the same for `tinyllama-cpp`. Then start a new chat.
+  The setting is stored in `~/.open-webui`, so it survives restarts.
+- Open WebUI writes `.webui_secret_key` into the directory it starts from; it is git-ignored.

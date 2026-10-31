@@ -6,3 +6,4 @@ bench/results/
 __pycache__/
 .venv/
 bench/data/wikitext2-test.txt
+.webui_secret_key
