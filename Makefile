@@ -25,8 +25,8 @@ WEIGHTS     := $(MODELS)/tinyllama-$(WTYPE).bin
 TOKENIZER   := $(MODELS)/tokenizer.bin
 #CACHE       := baseline
 #CACHE       := paged
-#CACHE       := radix
-CACHE       := streaming
+CACHE       := radix
+#CACHE       := streaming
 ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) --cache $(CACHE)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
