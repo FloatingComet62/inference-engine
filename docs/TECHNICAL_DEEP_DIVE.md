@@ -148,6 +148,30 @@ Speculative decoding guesses several tokens cheaply and checks them all in one b
 
 Result: 2.0x decode on "repeat / summarise this paragraph" (57 -> 116 tok/s, 83% of drafts accepted, ~3.3 tokens per verify); neutral on normal questions because matches are rare. 24/24 test outputs byte-identical. It only runs at temperature 0 without a repetition penalty, since verification compares raw greedy choices. On this CPU verification is not free (prefill ~200 tok/s vs decode ~60), so it pays only when about 2+ of 4 drafts are accepted; a faster prefill kernel would raise the gain.
 
+**Planned: two-model speculation with MobileLLM-125M** (teammate's plan, `SPECULATIVE.md` in the repo; not built yet). A small draft model proposes k tokens one at a time, TinyLlama verifies them in one batched pass, and the existing accept/rollback harness is reused unchanged.
+
+| Property | MobileLLM-125M (draft) | TinyLlama-1.1B (target) |
+| --- | --- | --- |
+| Architecture | Llama (LlamaForCausalLM) | Llama |
+| Layers / hidden / FFN | 30 / 576 / 1536 | 22 / 2048 / 5632 |
+| Query / KV heads, head size | 9 / 3, 64 | 32 / 4, 64 |
+| Vocabulary, context | 32,000, 2,048 | 32,000, 2,048 |
+| RoPE theta, RMSNorm eps | 10,000, 1e-5 | 10,000, 1e-5 |
+| Parameters | 124.6M (embeddings shared with the output head) | 1.1B |
+| Bytes read per token (4-bit) | ~80 MB (estimate) | 615 MB |
+
+How it would be built:
+
+1. **Vocabulary gate first:** a stdlib script compares both tokenizers' token-to-id maps; identical maps mean one tokenizer serves both models (same SentencePiece model, so expected but unproven).
+2. **Second compiled model:** our sizes are compile-time constants, so the core is compiled a second time with the draft's sizes in a separate namespace (`-DTL_DRAFT`, namespace `tld`); kernels are header-only and specialise for free. Weights come from the ungated `vonjack/MobileLLM-125M-HF` mirror through the existing `convert.py`, then the same `q4a` quantisation.
+3. **Greedy draft loop:** draft `next, d1..d(k-1)` one by one, verify `[next, d1..dk]` in one `forward_all`, accept while each matches the target's argmax. Lockstep rule: the draft's KV cache must cover the same committed tokens as the target's; after a full accept the last draft token is fed to the draft once more so it has no gap.
+4. **Sampling (temperature > 0):** standard rejection sampling (Leviathan et al. 2023): accept a draft token with probability min(1, p/q), otherwise resample from the normalised max(0, p - q); this keeps the output distribution exactly the target's, which would make speculation usable in chat.
+5. **Adaptive k** from the running acceptance rate, and benchmark rows for acceptance, tokens per verify and speed-up.
+
+**Expected gain, on our measured numbers** (estimates): one cycle with k = 4 costs ~25 ms to verify 5 tokens plus (4 + α^4) x ~3 ms of draft steps, where α is the acceptance rate. That gives ~52 tok/s at α = 0.5, break-even (~62) at α = 0.6, ~73 at 0.7, ~88 at 0.8 and ~105 at 0.9, against 60.5 today. The teammate's plan assumed 805 MB per token and 50 GB/s, which made the draft look cheaper (break-even at α = 0.5); our measured 615 MB and ~37 GB/s move break-even to about 0.6.
+
+**Risks:** the vocabulary check (highest risk), low acceptance on ordinary prompts (fallback: turn speculation off below an acceptance floor, keep n-gram for repetitive text), verification being compute-bound (keep k at 8 or less), and the licence: MobileLLM is released for non-commercial research.
+
 **Sampler** (`src/sampler.hpp`):
 
 | Setting | What it does | Default |
@@ -257,6 +281,8 @@ Short, honest answers to the questions mentors and judges are most likely to ask
 
 **What is speculative decoding here, without a draft model?** Prompt lookup: when the last few tokens appeared earlier, propose what followed and verify up to 4 tokens in one batched pass. With greedy decoding the output is identical; it doubled speed on summarise/repeat tasks.
 
+**Why MobileLLM-125M as the draft model, and will it actually help?** It is a plain Llama model with exactly TinyLlama's vocabulary, context and position settings, so its guesses are TinyLlama tokens with no translation, and at 4-bit it reads ~80 MB per token versus 615 MB. On our measurements it beats plain decoding only when more than ~60% of its guesses are accepted (~1.2x at 70%, ~1.45x at 80%). It is planned, not built, so the honest answer is "we will measure it"; the first step is checking that both tokenizers match.
+
 **What did not work?** Using E-cores (power budget is shared), the auto-tuner on a noisy machine (picked a worse setting), and fusion on the laptop (memory-bound, so no decode gain).
 
 **Does it generalise to other models?** Only Llama-family models with the same structure, by changing `src/config.hpp` and re-converting; that is a deliberate trade-off for speed and simplicity.
@@ -283,3 +309,4 @@ The engine is specialised and laptop-tuned; the main open gaps are prefill speed
 3. AVX-512 / AVX512-VNNI kernel path chosen at runtime, and a faster prefill accumulation order (trading the bit-identical guarantee for speed, as a flag).
 4. Make the auto-tuner robust: require a >3% win in two sweeps, run on an idle machine.
 5. Offline folding of RMSNorm gains into the weights (the rest of Priority 3).
+6. Two-model speculative decoding with a MobileLLM-125M draft (`SPECULATIVE.md`): vocabulary check, second compiled model, greedy loop with the byte-identical test, then rejection sampling and adaptive k.

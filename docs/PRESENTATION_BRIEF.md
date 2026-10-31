@@ -48,7 +48,7 @@ Twelve slides, about 8-10 minutes, ending on a live demo; each slide carries one
 6. **Quantisation that keeps quality.** Activation-aware 4-bit (`q4a`): perplexity gap to fp32 from +3.9% to +0.5% at the same size and speed. Bar chart of ppl: fp32 / Q4 / q4a.
 7. **Hardware-aware threading.** Hybrid CPU problem: E-cores stall every step. Pinning to P-cores: 13.5 -> 26.6 tok/s. Thread-count chart (4/8/12 threads).
 8. **Prefill and attention.** Batched prefill, tiled VNNI kernel, vectorised attention, fusion (199 -> 111 sync points per token).
-9. **Long context and speculation.** int8 KV cache: +13% at 1.7k tokens, -65 MB. Speculative decoding: 2x on summarise/repeat prompts, byte-identical output.
+9. **Long context and speculation.** int8 KV cache: +13% at 1.7k tokens, -65 MB. Speculative decoding: 2x on summarise/repeat prompts, byte-identical output; next, a MobileLLM-125M draft model (estimate table in the planned-next section).
 10. **Head to head with Ollama.** The headline table, both power modes, plus the teammate's i9 result stated honestly.
 11. **What did not work and what we learned.** E-cores for prefill, the auto-tuner, benchmark pitfalls (prompt cache, power modes).
 12. **Live demo + next steps.** Open WebUI side by side, the dashboard; next: AVX-512 path, quality vs Q4_0, auto-tuner.
@@ -86,6 +86,26 @@ Four of the five shipped with a measured win; the auto-tuner was dropped because
 | P5 | Speculative decoding (`--spec ngram`), prompt-lookup drafts, greedy | 2.0x decode on summarise/repeat prompts (57 -> 116 tok/s, 83% acceptance); neutral on normal questions; output byte-identical in 24/24 tests | shipped (opt-in) |
 
 The best slide material is P1 (quality) and P5 (2x with identical output); P3 is the best "engineering depth" story; P2 is a good "what we learned" story.
+
+## Planned next: two-model speculative decoding
+
+The next step for speculative decoding is a real draft model, MobileLLM-125M, proposing tokens that TinyLlama-1.1B verifies; on our measured numbers it should pay off once more than about 60% of drafts are accepted (estimate, not yet built). Full plan: `SPECULATIVE.md`.
+
+**Why these two models.** MobileLLM-125M (Meta) is a plain Llama-architecture model (30 thin layers, hidden size 576, 3 KV heads) with the same 32,000-token Llama vocabulary, same context length (2,048) and same RoPE and RMSNorm settings as TinyLlama. Shared vocabulary means a draft token is directly a TinyLlama token, with no translation. At 4-bit it reads about 80 MB per token against TinyLlama's 615 MB, so a draft step costs roughly a fifth of a real one.
+
+**How it extends what we have.** Today's `--spec ngram` already does batched verification, acceptance, rollback and the byte-identical check; the draft model only replaces where guesses come from. That makes it a strong slide: "same verifier, smarter guesser".
+
+| Draft acceptance rate | Tokens per cycle (k = 4) | Estimated decode tok/s | vs 60.5 today |
+| --- | --- | --- | --- |
+| 50% | 1.9 | ~52 | slower |
+| 60% | 2.3 | ~62 | break-even |
+| 70% | 2.8 | ~73 | 1.2x |
+| 80% | 3.4 | ~88 | 1.45x |
+| 90% | 4.1 | ~105 | 1.75x |
+
+Assumptions (all from our own measurements): 25 ms to verify 5 tokens (batched pass at ~200 tok/s), ~3 ms per draft step. The biggest lever is verification cost: a faster prefill kernel raises every row.
+
+**Say on the slide:** planned, not built; the model download is a community mirror (`vonjack/MobileLLM-125M-HF`) of Meta's checkpoint, which carries a non-commercial research licence; the first build step is a check that both tokenizers map every word to the same id.
 
 ## What did not work, and what we learned
 
