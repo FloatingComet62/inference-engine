@@ -3,8 +3,8 @@
 # one JSON line per run appended to bench/results/mpi.jsonl (plus the settings used).
 # Usage: bench/mpi_bench.sh <np> <iface> [hosts] [n]
 #   np     MPI ranks (machines x ranks per machine)
-#   iface  network interface for MPI traffic: tailscale0, wlan0/wlo1, lo (one machine)
-#   hosts  mpirun --host list, e.g. "100.75.81.84:1,100.80.1.2:1" (empty = this machine)
+#   iface  LAN subnet (e.g. 192.168.1.0/24, see scripts/lan_subnet.sh) or interface; lo = one machine
+#   hosts  mpirun --host list of LAN IPs, e.g. "192.168.1.10:1,192.168.1.11:1" (empty = this machine)
 set -euo pipefail
 NP=${1:?np}; IFACE=${2:?iface}; HOSTS=${3:-}; N=${4:-64}
 OUT=bench/results/mpi.jsonl

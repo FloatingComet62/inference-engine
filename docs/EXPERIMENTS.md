@@ -69,7 +69,7 @@ do not repeat text; see P5 below for where it pays.
 
 ## Multi-machine (Open MPI)
 
-`make mpi-run NP=2 MPI_IFACE=tailscale0 MPI_HOSTS=100.x.y.z:1,100.a.b.c:1` (or `MPI_IFACE=wlo1`, or `lo` with no hosts for one machine).
+`make mpi-run NP=2 MPI_HOSTS=192.168.1.10:1,192.168.1.11:1` (LAN IPs, one rank each). MPI traffic is pinned to this machine's LAN subnet (`scripts/lan_subnet.sh`, e.g. `192.168.1.0/24`), which works whatever each machine calls its interface; override with `MPI_IFACE=<subnet or interface>`, or `MPI_IFACE=lo` with no hosts for one machine.
 Every machine needs the repo at the same path, `make mpi-build`, `models/tinyllama-q4a.bin` + `tokenizer.bin`,
 Open MPI and passwordless SSH from the first host. `make mpi-bench` sweeps streams x micro-batch into
 `bench/results/mpi.jsonl` (aggregate tok/s, per-stream tok/s, layer split, measured bandwidth/RAM, link RTT, busy %).

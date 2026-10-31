@@ -46,7 +46,7 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
-	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_IFACE=tailscale0 MPI_HOSTS=a:1,b:1)"
+	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_HOSTS=192.168.1.10:1,192.168.1.11:1)"
 	@echo "  make mpi-bench     MPI throughput sweep (streams x micro-batch) -> bench/results/mpi.jsonl"
 	@echo "  make up            start Ollama + this engine's API + Open WebUI (make down stops them)"
 	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
@@ -227,7 +227,7 @@ distclean: clean
 # ---- multi-machine: pipeline parallel over Open MPI (src/pipeline.cpp) ----
 # Every machine needs the same repo path, `make mpi-build`, the q4a model and passwordless SSH.
 NP        ?= 2
-MPI_IFACE ?= tailscale0
+MPI_IFACE ?= $(shell scripts/lan_subnet.sh)
 MPI_HOSTS ?=
 STREAMS   ?= 4
 MICRO     ?= 4
