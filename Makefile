@@ -27,7 +27,7 @@ TOKENIZER   := $(MODELS)/tokenizer.bin
 #CACHE       := paged
 CACHE       := radix
 #CACHE       := streaming
-ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) --cache $(CACHE)
+ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) --cache $(CACHE) $(ENGINE_FLAGS)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
