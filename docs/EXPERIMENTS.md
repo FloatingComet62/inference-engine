@@ -14,7 +14,7 @@ Add a row whenever you try something; keep the losers, they are results too.
 | Summaries / quoting text (2x decode) | add `--spec ngram` to ENGINE_FLAGS (greedy only: `TEMP=0`) |
 | Compare against Ollama | `make compare N=64 RUNS=5 WTYPE=q4a ENGINE_FLAGS="--kv q8"` |
 | Quality vs fp32 (WikiText-2) | `make eval WTYPE=q4a` |
-| Chat UI with both engines | `make serve WTYPE=q4a ENGINE_FLAGS="--kv q8"` + `make ollama-serve` + `make webui` -> http://localhost:3000 |
+| Chat UI with both engines | `make serve WTYPE=q4a ENGINE_FLAGS="--kv q8"` + `make ollama-serve` + `make webui` (via uv, first run downloads ~1 GB) -> http://localhost:3000 |
 | Sanity check after any change | `make smoke` |
 
 `WTYPE=q4a` is built once from fp32 (~100 s, `make model WTYPE=q4a`). Before benchmarking:

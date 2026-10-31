@@ -29,7 +29,7 @@ BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --thread
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui webui-stop
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -43,7 +43,7 @@ help:
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
 	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
-	@echo "  make webui         Open WebUI (Docker) on :3000, connected to Ollama + this engine"
+	@echo "  make webui         Open WebUI (via uv) on :3000, connected to Ollama + this engine"
 	@echo "  make eval          WikiText-2 perplexity + KL divergence vs fp32"
 	@echo "                     every target takes WTYPE=q4 (default) | q4a | q8 | f32"
 	@echo "  make venv          create the Python virtual environment in .venv"
@@ -139,17 +139,17 @@ serve: build model
 	@$(PY) tools/openai_server.py --port $(API_PORT) --model $(WEIGHTS) --tokenizer $(TOKENIZER) \
 	    --threads $(THREADS) --engine-args "$(ENGINE_FLAGS)"
 
-webui:
-	@docker rm -f open-webui >/dev/null 2>&1 || true
-	docker run -d --name open-webui --network host -v open-webui:/app/backend/data \
-	    -e PORT=$(WEBUI_PORT) -e WEBUI_AUTH=False \
-	    -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
-	    -e OPENAI_API_BASE_URL=http://127.0.0.1:$(API_PORT)/v1 -e OPENAI_API_KEY=none \
-	    ghcr.io/open-webui/open-webui:main
-	@echo "Open WebUI: http://localhost:$(WEBUI_PORT)  (also run: make serve, make ollama-serve)"
+# Runs via uv (fetches Python 3.11, which Open WebUI needs; no Docker daemon). First run
+# installs its dependencies (several GB) into uv's cache. Chats are kept in WEBUI_DATA.
+WEBUI_DATA ?= $(HOME)/.open-webui
 
-webui-stop:
-	docker rm -f open-webui
+webui:
+	@mkdir -p $(WEBUI_DATA)
+	@echo "Open WebUI: http://localhost:$(WEBUI_PORT)  (also run: make serve, make ollama-serve)"
+	UV_TORCH_BACKEND=cpu DATA_DIR=$(WEBUI_DATA) WEBUI_AUTH=False \
+	    OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+	    OPENAI_API_BASE_URL=http://127.0.0.1:$(API_PORT)/v1 OPENAI_API_KEY=none \
+	    uvx --python 3.11 open-webui@latest serve --host 127.0.0.1 --port $(WEBUI_PORT)
 
 ollama-serve:
 	sudo pkill ollama && OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" ollama serve
