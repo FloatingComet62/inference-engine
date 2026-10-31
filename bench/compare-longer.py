@@ -26,6 +26,17 @@ import urllib.request
 from pathlib import Path
 
 SYSTEM = "You are a helpful AI assistant. Follow the requested structure carefully and provide complete, detailed answers."
+# Each run gets a unique tag at the very start of the system prompt, so Ollama's
+# server-side prompt cache cannot reuse KV from earlier runs or earlier sessions
+# (without it, repeat runs reported 18,000-27,000 tok/s "prefill" in ~17 ms).
+RUN_ID = os.urandom(4).hex()
+_run_counter = 0
+
+
+def tagged_system():
+    global _run_counter
+    _run_counter += 1
+    return f"[session {RUN_ID}-{_run_counter}] {SYSTEM}"
 PROMPTS = [
     """You are the lead systems engineer designing a CPU-only inference engine for decoder-only transformer models. Write a detailed engineering design review. The engine must load model weights, tokenize input, execute transformer layers, maintain KV state for multiple independent sequences, and stream generated tokens.
 
@@ -156,14 +167,14 @@ def peak_rss_mb(pids):
     return best
 
 
-def chat_template(user):
-    return f"<|system|>\n{SYSTEM}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n"
+def chat_template(system, user):
+    return f"<|system|>\n{system}</s>\n<|user|>\n{user}</s>\n<|assistant|>\n"
 
 
 # ---------------------------------------------------------------- our engine
 def run_engine(a, user):
     cmd = [a.bin, "bench", "--model", a.model, "--tokenizer", a.tokenizer,
-           "-p", user, "--system", SYSTEM, "-n", str(a.n), "--threads", str(a.threads)]
+           "-p", user, "--system", tagged_system(), "-n", str(a.n), "--threads", str(a.threads)]
     with Energy() as e:
         p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -198,7 +209,7 @@ def run_ollama(a, user):
     with Energy() as e:
         r = http(f"{a.ollama_url}/api/generate", {
         "model": a.ollama_model,
-        "prompt": chat_template(user),
+        "prompt": chat_template(tagged_system(), user),
         "raw": True,
         "stream": False,
         "options": {"temperature": 0, "seed": 42, "num_predict": a.n,
@@ -219,6 +230,15 @@ def run_ollama(a, user):
 
 
 # ---------------------------------------------------------------- helpers
+def physical_cores():
+    """Same default as the Makefile (scripts/physical_cores.sh), not os.cpu_count()."""
+    script = Path(__file__).resolve().parent.parent / "scripts" / "physical_cores.sh"
+    try:
+        return int(subprocess.run([str(script)], capture_output=True, text=True, check=True).stdout)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return os.cpu_count() or 4
+
+
 def measure_bandwidth(a):
     if not a.bandwidth_bin or not Path(a.bandwidth_bin).exists():
         return None
@@ -301,12 +321,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", choices=["engine", "ollama", "both"], default="both")
     ap.add_argument("--bin", default="build/tinyllama")
-    ap.add_argument("--model", default="models/tinyllama-f32.bin")
+    ap.add_argument("--model", default="models/tinyllama-q4.bin")
     ap.add_argument("--tokenizer", default="models/tokenizer.bin")
     ap.add_argument("--bandwidth-bin", default="build/bandwidth")
     ap.add_argument("--ollama-model", default="tinyllama:1.1b")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
-    ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--threads", type=int, default=physical_cores(),
+                    help="default: scripts/physical_cores.sh, the same as the Makefile")
     ap.add_argument("-n", type=int, default=512, help="max new tokens per run (long benchmark default)")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--quality", action="store_true", help="also measure perplexity vs fp32 reference")
@@ -319,7 +340,8 @@ def main():
     print(f"benchmark: {a.runs} runs, up to {a.n} new tokens, {a.threads} threads, greedy")
     gbps = measure_bandwidth(a)
     if gbps:
-        print(f"  memory read bandwidth: {gbps:.1f} GB/s")
+        print(f"  memory read probe: {gbps:.1f} GB/s (pure read loop; on laptops in powersave it can read"
+              f" below what a real workload sustains, so it is shown for reference only)")
     if not rapl_domains():
         print("  energy: RAPL not readable, skipped (run: make rapl-perms)")
 
@@ -345,8 +367,7 @@ def main():
             ("model MB", lambda m, nb: fmt(nb / 1e6, ".0f")),
             ("CPU %", lambda m, nb: fmt(m["cpu_util_pct"], ".0f")),
             ("J/token", lambda m, nb: fmt(m["j_per_tok"], ".2f"))]
-    if gbps:
-        cols.append(("% BW limit", lambda m, nb: fmt(100 * m["decode_tps"] * nb / (gbps * 1e9) if nb else None, ".0f")))
+    cols.append(("read GB/s", lambda m, nb: fmt(m["decode_tps"] * nb / 1e9 if nb else None, ".1f")))
     print()
     hdr = f"{'engine':<24}" + "".join(f"{c:>14}" for c, _ in cols)
     print(hdr)
@@ -363,8 +384,7 @@ def main():
     print(f"CPU % = CPU time / wall time, 100% per busy core ({a.threads} threads -> max {100 * a.threads}%)")
     print("TTFT  = prompt in -> first token (Ollama: + its model load time)")
     print("peak RAM includes mmap'd weight pages (engine) / runner lifetime peak (Ollama)")
-    if gbps:
-        print("% BW limit = decode tok/s divided by (bandwidth / bytes read per token)")
+    print("read GB/s = decode tok/s x weight bytes per token (effective memory bandwidth used by decode)")
 
     RESULTS.mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
