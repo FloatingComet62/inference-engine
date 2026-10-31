@@ -1,6 +1,7 @@
 #pragma once
 #include "config.hpp"
 #include "kernels_q4.hpp"
+#include "kv_cache.hpp"
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -24,7 +25,9 @@ struct Weights {
 
 class Model {
 public:
-    explicit Model(const std::string& path);
+    // `cache` must outlive the Model; the model occupies one sequence in it.
+    // A new Model always starts a fresh sequence (the cache may keep others).
+    Model(const std::string& path, KVCache& cache);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -35,6 +38,11 @@ public:
     // Runs n prompt tokens starting at `pos` in batches of PREFILL_CHUNK
     // (matrix x matrix); returns the logits of the last token.
     const float* prefill(const int* tokens, int n, int pos);
+
+    // Consults the cache for tokens[0..n) already stored for this sequence.
+    // prefill() calls it at position 0 and skips the matched prefix entirely
+    // (its KV rows are read back from the cache). Returns the matched length.
+    int use_cached_prefix(const int* tokens, int n);
 
     // Bytes of weights streamed from RAM per generated token
     // (everything except the embedding table, of which only one row is read).
@@ -57,8 +65,18 @@ private:
     std::vector<int32_t> xs_;  // per-block Q4 zero-point correction (-8 * group sums)
 
     std::vector<float> x_, xb_, xb2_, q_, att_, hb_, hb2_, logits_;
-    std::vector<float> key_cache_, value_cache_;   // [N_LAYERS][MAX_SEQ][KV_DIM]
+    std::vector<float> k_tmp_, v_tmp_;             // [T][KV_DIM] freshly computed rows
+    // Contiguous working copy of the cache for the attention kernel, per layer:
+    // keys rotated at their LOGICAL slot, values as stored. A slot's content only
+    // changes when the cache re-bases (StreamingLLM past its window) or a position
+    // is re-stored (ppl rewinds), so only new slots are copied each step and
+    // everything is recopied after a re-base.
+    std::vector<float> k_rot_, v_work_;            // [N_LAYERS][MAX_SEQ][KV_DIM]
+    int work_valid_ = 0;                           // slots [0, work_valid_) are current
     std::vector<float> rope_cos_, rope_sin_;       // [MAX_SEQ][HEAD_DIM/2]
+
+    KVCache* cache_ = nullptr;
+    SeqId seq_ = -1;
 };
 
 }  // namespace tl

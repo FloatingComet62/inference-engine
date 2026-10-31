@@ -7,6 +7,7 @@
 //   tinyllama ppl --text FILE     perplexity + top-1 predictions (quality check);
 //                                 with --ref-model also KL divergence and top-1 agreement
 //   tinyllama quantize --out F    write a Q4 (or --wtype q8) copy of an fp32 model
+#include "kv_cache.hpp"
 #include "model.hpp"
 #include "threadpool.hpp"
 #include "sampler.hpp"
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 #include <fstream>
 #include <stdexcept>
 #include <sstream>
@@ -57,6 +59,9 @@ struct Args {
     std::string wtype = "q4";  // quantize: q4 | q8
     std::string pool = "spin";     // spin (persistent pool) | omp
     std::string prefill = "batch"; // batch | seq (token by token)
+    std::string cache = "radix";  // baseline|paged|radix|streaming
+    int window = tl::MAX_SEQ;     // streaming: window tokens (incl. sinks)
+    int sinks = 4;                // streaming: attention-sink tokens
 };
 
 [[noreturn]] void usage(int code) {
@@ -79,7 +84,11 @@ struct Args {
         "  --out PATH          quantize: output file\n"
         "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n"
         "  --pool spin|omp     thread runtime (default spin)\n"
-        "  --prefill batch|seq prompt processing (default batch)\n");
+        "  --prefill batch|seq prompt processing (default batch)\n"
+        "  --cache NAME        kv cache backend: baseline|paged|radix|streaming\n"
+        "                      (default radix)\n"
+        "  --window N          streaming: window tokens incl. sinks (default 2048)\n"
+        "  --sinks N           streaming: attention-sink tokens (default 4)\n");
     std::exit(code);
 }
 
@@ -113,6 +122,9 @@ Args parse(int argc, char** argv) {
         else if (k == "--wtype") a.wtype = val();
         else if (k == "--pool") a.pool = val();
         else if (k == "--prefill") a.prefill = val();
+        else if (k == "--cache") a.cache = val();
+        else if (k == "--window") a.window = std::atoi(val().c_str());
+        else if (k == "--sinks") a.sinks = std::atoi(val().c_str());
         else if (k == "-h" || k == "--help") usage(0);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); usage(1); }
     }
@@ -203,13 +215,23 @@ int main(int argc, char** argv) {
         }
         if (a.mode == "quantize") {
             if (a.out.empty() || (a.wtype != "q4" && a.wtype != "q8")) usage(1);
-            tl::Model src(a.model);
+            tl::BaselineKVCache unused;   // the forward pass is not run
+            tl::Model src(a.model, unused);
             src.save_quantized(a.out, a.wtype == "q4" ? tl::WType::Q4 : tl::WType::Q8, tl::WType::Q8);
             std::fprintf(stderr, "wrote %s\n", a.out.c_str());
             return 0;
         }
         auto t_load = Clock::now();
-        tl::Model model(a.model);
+        std::unique_ptr<tl::KVCache> kv_cache;
+        if (a.cache == "baseline") kv_cache = std::make_unique<tl::BaselineKVCache>();
+        else if (a.cache == "paged") kv_cache = std::make_unique<tl::PagedKVCache>();
+        else if (a.cache == "streaming")
+            kv_cache = std::make_unique<tl::StreamingKVCache>((size_t)a.window, a.sinks);
+        else if (a.cache != "radix")
+            throw std::runtime_error("unknown --cache " + a.cache +
+                                     " (baseline|paged|radix|streaming)");
+        else kv_cache = std::make_unique<tl::RadixKVCache>();  // default: prefix reuse
+        tl::Model model(a.model, *kv_cache);
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);
         tl::Sampler sampler(a.temp, a.top_p, a.seed);
@@ -218,9 +240,12 @@ int main(int argc, char** argv) {
         if (a.mode == "run") {
             auto prompt = tok.encode_first_turn(a.system, a.prompt);
             Stats s = generate(model, tok, sampler, prompt, pos, a.n, true, a.ignore_eos);
-            std::fprintf(stderr, "\n\n[prompt %d tok, %.1f tok/s | generated %d tok, %.2f tok/s | %d threads]\n",
+            std::fprintf(stderr, "\n\n[prompt %d tok, %.1f tok/s | generated %d tok, %.2f tok/s | %d threads"
+                         " | cache %zu/%zu tok, %zu evict]\n",
                          s.prompt_tokens, s.prompt_tokens / (s.prefill_ms / 1000.0),
-                         s.gen_tokens, s.gen_tokens / (s.decode_ms / 1000.0), threads_in_use());
+                         s.gen_tokens, s.gen_tokens / (s.decode_ms / 1000.0), threads_in_use(),
+                         kv_cache->used_tokens(), kv_cache->capacity_tokens(),
+                         kv_cache->stats().evictions);
         } else if (a.mode == "chat") {
             std::fprintf(stderr, "TinyLlama chat. Type /exit to quit.\n");
             bool first = true;
@@ -232,8 +257,10 @@ int main(int argc, char** argv) {
                 auto prompt = first ? tok.encode_first_turn(a.system, line) : tok.encode_next_turn(line);
                 first = false;
                 Stats s = generate(model, tok, sampler, prompt, pos, a.n, true, false);
-                std::fprintf(stderr, "\n[%.2f tok/s, context %d/%d]\n",
-                             s.gen_tokens / (s.decode_ms / 1000.0), pos, tl::MAX_SEQ);
+                std::fprintf(stderr, "\n[%.2f tok/s, context %d/%d, cache %zu/%zu tok, %zu evict]\n",
+                             s.gen_tokens / (s.decode_ms / 1000.0), pos, tl::MAX_SEQ,
+                             kv_cache->used_tokens(), kv_cache->capacity_tokens(),
+                             kv_cache->stats().evictions);
             }
         } else if (a.mode == "ppl") {
             // Scores the text in independent windows of a.ctx tokens (each starts with BOS).
@@ -247,8 +274,9 @@ int main(int argc, char** argv) {
             auto ids = tok.encode(text, true);
             if ((int)ids.size() > a.max_tokens) ids.resize(a.max_tokens);
             const int ctx = std::max(2, std::min(a.ctx, tl::MAX_SEQ));
+            tl::BaselineKVCache ref_cache;
             std::unique_ptr<tl::Model> ref;
-            if (!a.ref_model.empty()) ref = std::make_unique<tl::Model>(a.ref_model);
+            if (!a.ref_model.empty()) ref = std::make_unique<tl::Model>(a.ref_model, ref_cache);
             // log-softmax normaliser and argmax of a logits row
             auto lse = [](const float* l, int& arg) {
                 float mx = l[0]; arg = 0;

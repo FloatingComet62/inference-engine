@@ -25,7 +25,7 @@ if(TL_SANITIZE)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_executable(tinyllama src/main.cpp src/model.cpp src/tokenizer.cpp)
+add_executable(tinyllama src/main.cpp src/model.cpp src/tokenizer.cpp src/kv_cache.cpp)
 add_executable(bandwidth tools/bandwidth.cpp)
 
 if(TL_TINY_TEST)

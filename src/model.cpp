@@ -31,7 +31,7 @@ inline void rope(float* v, const float* cs, const float* sn) {
 }
 }  // namespace
 
-Model::Model(const std::string& path) {
+Model::Model(const std::string& path, KVCache& cache) : cache_(&cache) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open weights: " + path + " (run `make setup`)");
     struct stat st{};
@@ -95,8 +95,10 @@ Model::Model(const std::string& path) {
     x_.resize(T * DIM); xb_.resize(T * DIM); xb2_.resize(T * DIM); q_.resize(T * DIM);
     att_.resize(T * N_HEADS * MAX_SEQ);
     hb_.resize(T * HIDDEN); hb2_.resize(T * HIDDEN); logits_.resize(VOCAB);
-    key_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
-    value_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    k_tmp_.resize(T * KV_DIM); v_tmp_.resize(T * KV_DIM);
+    k_rot_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    v_work_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    seq_ = cache_->begin_sequence();
 
     constexpr int half = HEAD_DIM / 2;
     rope_cos_.resize((size_t)MAX_SEQ * half);
@@ -110,7 +112,12 @@ Model::Model(const std::string& path) {
 }
 
 Model::~Model() {
+    if (cache_) cache_->end_sequence(seq_);
     if (map_) munmap(map_, file_size_);
+}
+
+int Model::use_cached_prefix(const int* tokens, int n) {
+    return cache_->longest_cached_prefix(seq_, tokens, n);
 }
 
 size_t Model::bytes_per_token() const {
@@ -175,10 +182,17 @@ void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, in
 }
 
 const float* Model::prefill(const int* tokens, int n, int pos) {
+    // Prompt tokens already cached for this sequence are skipped entirely; the last
+    // one is always run because its logits are needed.
+    int i = pos == 0 ? use_cached_prefix(tokens, n) : 0;
+    if (i > n - 1) i = n - 1;
+    const int cap = (int)cache_->capacity_tokens();
     const float* logits = nullptr;
-    for (int i = 0; i < n; i += PREFILL_CHUNK) {
-        const int T = n - i < PREFILL_CHUNK ? n - i : PREFILL_CHUNK;
+    while (i < n) {
+        int T = n - i < PREFILL_CHUNK ? n - i : PREFILL_CHUNK;
+        if (pos + i + T > cap) T = pos + i < cap ? cap - pos - i : 1;   // never straddle a re-base
         logits = forward_batch(tokens + i, T, pos + i);
+        i += T;
     }
     return logits;
 }
@@ -242,38 +256,60 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
     constexpr int half = HEAD_DIM / 2;
     const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
 
+    // Cache-relative position (RoPE re-basing, StreamingLLM). Below the cache
+    // capacity a token sits at its own position; a streaming backend past its
+    // window puts the newest token at the last retained slot. prefill() feeds
+    // tokens one at a time in that region, so a batch never straddles it.
+    const int cap = (int)cache_->capacity_tokens();
+    const bool rebased = pos0 >= cap;
+    // re-based slots or re-stored positions (ppl rewinds) invalidate the working copy
+    if (rebased) work_valid_ = 0;
+    else if (pos0 < work_valid_) work_valid_ = pos0;
+
     for (int t = 0; t < T; t++)
         std::memcpy(x + (size_t)t * DIM, w_.embed + (size_t)tokens[t] * DIM, DIM * sizeof(float));
 
+    int n_ctx = 0;   // slots the newest token attends to
     for (int l = 0; l < N_LAYERS; l++) {
         const LayerWeights& L = w_.layers[l];
-        float* kcache = key_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        float* vcache = value_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        // keys/values of consecutive positions are adjacent rows, so the matmul writes the cache directly
-        float* k = kcache + (size_t)pos0 * KV_DIM;
-        float* v = vcache + (size_t)pos0 * KV_DIM;
+        float* kw = k_rot_.data() + (size_t)l * MAX_SEQ * KV_DIM;
+        float* vw = v_work_.data() + (size_t)l * MAX_SEQ * KV_DIM;
 
         // ---- attention ----
         for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.attn_norm, DIM);
         mm(q, xb, L.wq, DIM, DIM, T);
-        mm(k, xb, L.wk, DIM, KV_DIM, T);
-        mm(v, xb, L.wv, DIM, KV_DIM, T);
+        mm(k_tmp_.data(), xb, L.wk, DIM, KV_DIM, T);
+        mm(v_tmp_.data(), xb, L.wv, DIM, KV_DIM, T);
         for (int t = 0; t < T; t++) {
-            const float* cs = &rope_cos_[(size_t)(pos0 + t) * half];
-            const float* sn = &rope_sin_[(size_t)(pos0 + t) * half];
-            for (int h = 0; h < N_HEADS; h++)    rope(q + (size_t)t * DIM + h * HEAD_DIM, cs, sn);
-            for (int h = 0; h < N_KV_HEADS; h++) rope(k + (size_t)t * KV_DIM + h * HEAD_DIM, cs, sn);
+            const int qpos = rebased ? cap - 1 : pos0 + t;
+            for (int h = 0; h < N_HEADS; h++)
+                rope(q + (size_t)t * DIM + h * HEAD_DIM, &rope_cos_[(size_t)qpos * half],
+                     &rope_sin_[(size_t)qpos * half]);
+            // K is stored UNROTATED (the cache may re-base it); rotation is applied below
+            cache_->store(seq_, l, pos0 + t, tokens[t], k_tmp_.data() + (size_t)t * KV_DIM,
+                          v_tmp_.data() + (size_t)t * KV_DIM);
         }
 
-        // causal: token t (position pos0 + t) attends to positions 0..pos0 + t
+        // Bring the working copy up to date: only slots not yet copied.
+        const int stored = cache_->stored_tokens(seq_);
+        n_ctx = stored < pos0 + T ? stored : pos0 + T;
+        for (int sl = work_valid_; sl < n_ctx; sl++) {
+            float* kr = kw + (size_t)sl * KV_DIM;
+            std::memcpy(kr, cache_->key_row(seq_, l, sl), KV_DIM * sizeof(float));
+            std::memcpy(vw + (size_t)sl * KV_DIM, cache_->value_row(seq_, l, sl), KV_DIM * sizeof(float));
+            for (int h = 0; h < N_KV_HEADS; h++)
+                rope(kr + h * HEAD_DIM, &rope_cos_[(size_t)sl * half], &rope_sin_[(size_t)sl * half]);
+        }
+
+        // causal: token t sees slots 0..pos0+t (all retained slots once re-based)
         parallel_for(T * N_HEADS, [&](int b, int e) {
             for (int idx = b; idx < e; idx++) {
-                const int t = idx / N_HEADS, h = idx % N_HEADS, pos = pos0 + t;
-                const float* qh = q + (size_t)t * DIM + h * HEAD_DIM;
-                float* att = att_.data() + (size_t)idx * MAX_SEQ;
+                const int t = idx / N_HEADS, h = idx % N_HEADS;
+                const int n = rebased ? n_ctx : pos0 + t + 1;
                 const int kvh = h / KV_MUL;
-                attend_head(xb + (size_t)t * DIM + h * HEAD_DIM, qh, kcache + kvh * HEAD_DIM,
-                            vcache + kvh * HEAD_DIM, KV_DIM, pos + 1, scale, att);
+                attend_head(xb + (size_t)t * DIM + h * HEAD_DIM, q + (size_t)t * DIM + h * HEAD_DIM,
+                            kw + kvh * HEAD_DIM, vw + kvh * HEAD_DIM, KV_DIM, n, scale,
+                            att_.data() + (size_t)idx * MAX_SEQ);
             }
         });
         mm(xb2, xb, L.wo, DIM, DIM, T);
@@ -290,6 +326,7 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
         for (size_t i = 0; i < (size_t)T * DIM; i++) x[i] += xb2[i];
     }
 
+    work_valid_ = rebased ? 0 : n_ctx;
     float* last = x + (size_t)(T - 1) * DIM;
     rmsnorm(last, last, w_.final_norm, DIM);
     mm(logits_.data(), last, w_.lm_head, DIM, VOCAB, 1);
