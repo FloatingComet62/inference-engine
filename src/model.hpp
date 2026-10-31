@@ -30,7 +30,11 @@ public:
     Model& operator=(const Model&) = delete;
 
     // Runs one token at position `pos`; returns logits[VOCAB].
-    const float* forward(int token, int pos);
+    const float* forward(int token, int pos) { return forward_batch(&token, 1, pos); }
+
+    // Runs n prompt tokens starting at `pos` in batches of PREFILL_CHUNK
+    // (matrix x matrix); returns the logits of the last token.
+    const float* prefill(const int* tokens, int n, int pos);
 
     // Bytes of weights streamed from RAM per generated token
     // (everything except the embedding table, of which only one row is read).
@@ -44,7 +48,10 @@ private:
     size_t file_size_ = 0;
     Weights w_{};
 
-    void mm(float* out, const float* x, const Mat& m, int n_in, int n_out);
+    // T tokens at positions pos..pos+T-1; logits for the last one only.
+    const float* forward_batch(const int* tokens, int T, int pos);
+    // out[T][n_out] = x[T][n_in] . W^T
+    void mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T);
     std::vector<int8_t> xq_;   // quantised activations for mm()
     std::vector<float> xd_;
 

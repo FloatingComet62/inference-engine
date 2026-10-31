@@ -53,16 +53,40 @@ inline void quantize_row_q8(const float* x, BlockQ8* out, int n) {
     }
 }
 
-// Activations: int8 values + one fp32 scale per block.
+// Activations: int8 values + one fp32 scale per block. Runs before every matmul, so it is
+// vectorised (round-to-nearest-even; the scalar path matches it with nearbyint).
 inline void quantize_act(const float* x, int8_t* xq, float* xd, int n) {
+#ifdef __AVX2__
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    for (int b = 0; b < n / QK; b++) {
+        const float* v = x + b * QK;
+        __m256 v0 = _mm256_loadu_ps(v), v1 = _mm256_loadu_ps(v + 8);
+        __m256 v2 = _mm256_loadu_ps(v + 16), v3 = _mm256_loadu_ps(v + 24);
+        __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
+                                 _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        const float d = _mm_cvtss_f32(m4) / 127.0f;
+        xd[b] = d;
+        const __m256 id = _mm256_set1_ps(d ? 1.0f / d : 0.0f);
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, id)), i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, id));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, id)), i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, id));
+        // packs work per 128-bit lane; the final permute restores element order
+        __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+        p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        _mm256_storeu_si256((__m256i*)(xq + b * QK), p);
+    }
+#else
     for (int b = 0; b < n / QK; b++) {
         const float* v = x + b * QK;
         float amax = 0.0f;
         for (int i = 0; i < QK; i++) amax = std::fmax(amax, std::fabs(v[i]));
         const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
         xd[b] = d;
-        for (int i = 0; i < QK; i++) xq[b * QK + i] = (int8_t)std::lround(v[i] * id);
+        for (int i = 0; i < QK; i++) xq[b * QK + i] = (int8_t)std::nearbyint(v[i] * id);
     }
+#endif
 }
 
 // ---------------------------------------------------------------- dot products
@@ -74,9 +98,16 @@ inline float hsum(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 // signed int8 w . signed int8 x -> 8 x int32 (|w| * sign-transferred x, no int16 overflow for |w|,|x| <= 127)
+// unsigned |w| x signed x -> 8 x int32: one instruction with AVX-VNNI, two without
+inline __m256i dot_u8s8(__m256i aw, __m256i sx) {
+#ifdef __AVXVNNI__
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sx);
+#else
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sx), _mm256_set1_epi16(1));
+#endif
+}
 inline __m256 dot_i8(__m256i w, __m256i x) {
-    const __m256i p16 = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w));
-    return _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, _mm256_set1_epi16(1)));
+    return _mm256_cvtepi32_ps(dot_u8s8(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)));
 }
 #endif
 
@@ -126,15 +157,41 @@ inline float dot_q8(const BlockQ8* w, const int8_t* xq, const float* xd, int nb)
 #endif
 }
 
-// out[n_out] = W . x for quantised W; xq/xd hold x already quantised by quantize_act.
-inline void matmul_q(float* __restrict out, const int8_t* xq, const float* xd,
-                     const void* W, WType t, int n_in, int n_out) {
-    const int nb = n_in / QK;
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < n_out; i++) {
-        out[i] = t == WType::Q4 ? dot_q4((const BlockQ4*)W + (size_t)i * nb, xq, xd, nb)
-                                : dot_q8((const BlockQ8*)W + (size_t)i * nb, xq, xd, nb);
+// N tokens x one weight row: each weight block is unpacked once and used N times, and the
+// N independent accumulators hide the FMA latency. Used by batched prefill.
+// out[k] = row . x_k, where x_k = xq + k * n_in (scales xd + k * nb).
+template <int N, class Blk>
+inline void dot_rows_n(const Blk* w, const int8_t* xq, const float* xd, int nb, float* out, size_t out_stride) {
+#ifdef __AVX2__
+    const int n_in = nb * QK;
+    __m256 acc[N];
+    for (int k = 0; k < N; k++) acc[k] = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++) {
+        __m256i wv;
+        if constexpr (sizeof(Blk) == sizeof(BlockQ4)) {
+            const __m128i raw = _mm_loadu_si128((const __m128i*)w[b].qs);
+            wv = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw, 4), raw), _mm256_set1_epi8(0x0F));
+            wv = _mm256_sub_epi8(wv, _mm256_set1_epi8(8));
+        } else {
+            wv = _mm256_loadu_si256((const __m256i*)w[b].qs);
+        }
+        const __m256i aw = _mm256_sign_epi8(wv, wv);
+        const float wd = (float)w[b].d;
+        for (int k = 0; k < N; k++) {
+            const __m256i xv = _mm256_loadu_si256((const __m256i*)(xq + (size_t)k * n_in + b * QK));
+            const __m256 p = _mm256_cvtepi32_ps(dot_u8s8(aw, _mm256_sign_epi8(xv, wv)));
+            acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(wd * xd[(size_t)k * nb + b]), p, acc[k]);
+        }
     }
+    for (int k = 0; k < N; k++) out[k * out_stride] = hsum(acc[k]);
+#else
+    for (int k = 0; k < N; k++) {
+        const int8_t* xk = xq + (size_t)k * nb * QK;
+        const float* dk = xd + (size_t)k * nb;
+        if constexpr (sizeof(Blk) == sizeof(BlockQ4)) out[k * out_stride] = dot_q4((const BlockQ4*)w, xk, dk, nb);
+        else out[k * out_stride] = dot_q8((const BlockQ8*)w, xk, dk, nb);
+    }
+#endif
 }
 
 }  // namespace tl

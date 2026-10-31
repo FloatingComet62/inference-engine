@@ -1,4 +1,4 @@
-// Maths primitives. matmul() is ~95% of runtime: this file is where most of
+// Maths primitives. The matmuls are ~95% of runtime: this file is where most of
 // the hackathon optimisation happens (4-bit weights, int8 dot products, AVX2).
 #pragma once
 #include "config.hpp"
@@ -7,16 +7,11 @@
 
 namespace tl {
 
-// out[n_out] = W[n_out x n_in] . x[n_in]   (W row-major, as stored by Hugging Face)
-inline void matmul(float* __restrict out, const float* __restrict x,
-                   const float* __restrict W, int n_in, int n_out) {
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < n_out; i++) {
-        const float* row = W + (size_t)i * n_in;
-        float s = 0.0f;
-        for (int j = 0; j < n_in; j++) s += row[j] * x[j];
-        out[i] = s;
-    }
+// dot product of one fp32 weight row with x
+inline float dot_f32(const float* __restrict row, const float* __restrict x, int n) {
+    float s = 0.0f;
+    for (int j = 0; j < n; j++) s += row[j] * x[j];
+    return s;
 }
 
 inline void rmsnorm(float* out, const float* x, const float* w, int n) {

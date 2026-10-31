@@ -31,6 +31,8 @@ constexpr int KV_MUL   = N_HEADS / N_KV_HEADS;     // 8 query heads share one KV
 constexpr float ROPE_THETA = 10000.0f;
 constexpr float RMS_EPS    = 1e-5f;
 
+constexpr int PREFILL_CHUNK = 32;   // prompt tokens per batched forward pass
+
 constexpr int BOS = 1;   // <s>
 constexpr int EOS = 2;   // </s>
 

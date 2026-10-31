@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "kernels.hpp"
+#include "threadpool.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -84,12 +85,13 @@ Model::Model(const std::string& path) {
     }
     w_.final_norm = take(DIM);
     w_.lm_head    = mat(VOCAB, DIM);
-    xq_.resize(HIDDEN > DIM ? HIDDEN : DIM);
+    constexpr size_t T = PREFILL_CHUNK;
+    xq_.resize(T * HIDDEN);
     xd_.resize(xq_.size() / QK);
 
-    x_.resize(DIM); xb_.resize(DIM); xb2_.resize(DIM); q_.resize(DIM);
-    att_.resize((size_t)N_HEADS * MAX_SEQ);
-    hb_.resize(HIDDEN); hb2_.resize(HIDDEN); logits_.resize(VOCAB);
+    x_.resize(T * DIM); xb_.resize(T * DIM); xb2_.resize(T * DIM); q_.resize(T * DIM);
+    att_.resize(T * N_HEADS * MAX_SEQ);
+    hb_.resize(T * HIDDEN); hb2_.resize(T * HIDDEN); logits_.resize(VOCAB);
     key_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
     value_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
 
@@ -112,10 +114,55 @@ size_t Model::bytes_per_token() const {
     return file_size_ - HEADER_BYTES - (size_t)VOCAB * DIM * sizeof(float) + DIM * sizeof(float);
 }
 
-void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out) {
-    if (m.t == WType::F32) return matmul(out, x, static_cast<const float*>(m.w), n_in, n_out);
-    quantize_act(x, xq_.data(), xd_.data(), n_in);
-    matmul_q(out, xq_.data(), xd_.data(), m.w, m.t, n_in, n_out);
+void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T) {
+    if (m.t == WType::F32) {
+        const float* W = static_cast<const float*>(m.w);
+        parallel_for(n_out, [&](int b, int e) {
+            for (int i = b; i < e; i++)
+                for (int t = 0; t < T; t++)
+                    out[(size_t)t * n_out + i] = dot_f32(W + (size_t)i * n_in, x + (size_t)t * n_in, n_in);
+        });
+        return;
+    }
+    const int nb = n_in / QK;
+    int8_t* xq = xq_.data();
+    float* xd = xd_.data();
+    auto quant = [&](int b, int e) {
+        for (int t = b; t < e; t++) quantize_act(x + (size_t)t * n_in, xq + (size_t)t * n_in, xd + t * nb, n_in);
+    };
+    if (T == 1) quant(0, 1); else parallel_for(T, quant);
+    if (T == 1) {   // decode: one dot product per row
+        parallel_for(n_out, [&](int b, int e) {
+            for (int i = b; i < e; i++)
+                out[i] = m.t == WType::Q4 ? dot_q4(static_cast<const BlockQ4*>(m.w) + (size_t)i * nb, xq, xd, nb)
+                                          : dot_q8(static_cast<const BlockQ8*>(m.w) + (size_t)i * nb, xq, xd, nb);
+        });
+        return;
+    }
+    // prefill: each weight row is unpacked once per 4 tokens and stays in L1 for all T
+    auto rows = [&](auto* W) {
+        parallel_for(n_out, [&](int b, int e) {
+            for (int i = b; i < e; i++) {
+                const auto* row = W + (size_t)i * nb;
+                int t = 0;
+                for (; t + 8 <= T; t += 8)
+                    dot_rows_n<8>(row, xq + (size_t)t * n_in, xd + t * nb, nb, out + (size_t)t * n_out + i, n_out);
+                for (; t < T; t++)
+                    dot_rows_n<1>(row, xq + (size_t)t * n_in, xd + t * nb, nb, out + (size_t)t * n_out + i, n_out);
+            }
+        });
+    };
+    if (m.t == WType::Q4) rows(static_cast<const BlockQ4*>(m.w));
+    else rows(static_cast<const BlockQ8*>(m.w));
+}
+
+const float* Model::prefill(const int* tokens, int n, int pos) {
+    const float* logits = nullptr;
+    for (int i = 0; i < n; i += PREFILL_CHUNK) {
+        const int T = n - i < PREFILL_CHUNK ? n - i : PREFILL_CHUNK;
+        logits = forward_batch(tokens + i, T, pos + i);
+    }
+    return logits;
 }
 
 void Model::save_quantized(const std::string& path, WType mats, WType head) const {
@@ -167,68 +214,79 @@ void Model::save_quantized(const std::string& path, WType mats, WType head) cons
     if (!f) throw std::runtime_error("write failed: " + path);
 }
 
-const float* Model::forward(int token, int pos) {
+const float* Model::forward_batch(const int* tokens, int T, int pos0) {
     float* x = x_.data();
     float* xb = xb_.data();
     float* xb2 = xb2_.data();
     float* q = q_.data();
     float* hb = hb_.data();
     float* hb2 = hb2_.data();
-    const float* cs = &rope_cos_[(size_t)pos * (HEAD_DIM / 2)];
-    const float* sn = &rope_sin_[(size_t)pos * (HEAD_DIM / 2)];
+    constexpr int half = HEAD_DIM / 2;
     const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
 
-    std::memcpy(x, w_.embed + (size_t)token * DIM, DIM * sizeof(float));
+    for (int t = 0; t < T; t++)
+        std::memcpy(x + (size_t)t * DIM, w_.embed + (size_t)tokens[t] * DIM, DIM * sizeof(float));
 
     for (int l = 0; l < N_LAYERS; l++) {
         const LayerWeights& L = w_.layers[l];
         float* kcache = key_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
         float* vcache = value_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        float* k = kcache + (size_t)pos * KV_DIM;
-        float* v = vcache + (size_t)pos * KV_DIM;
+        // keys/values of consecutive positions are adjacent rows, so the matmul writes the cache directly
+        float* k = kcache + (size_t)pos0 * KV_DIM;
+        float* v = vcache + (size_t)pos0 * KV_DIM;
 
         // ---- attention ----
-        rmsnorm(xb, x, L.attn_norm, DIM);
-        mm(q, xb, L.wq, DIM, DIM);
-        mm(k, xb, L.wk, DIM, KV_DIM);
-        mm(v, xb, L.wv, DIM, KV_DIM);
-        for (int h = 0; h < N_HEADS; h++)    rope(q + h * HEAD_DIM, cs, sn);
-        for (int h = 0; h < N_KV_HEADS; h++) rope(k + h * HEAD_DIM, cs, sn);
-
-#pragma omp parallel for schedule(static)
-        for (int h = 0; h < N_HEADS; h++) {
-            const float* qh = q + h * HEAD_DIM;
-            float* att = att_.data() + (size_t)h * MAX_SEQ;
-            const int kvh = h / KV_MUL;
-            for (int t = 0; t <= pos; t++) {
-                const float* kt = kcache + (size_t)t * KV_DIM + kvh * HEAD_DIM;
-                float s = 0.0f;
-                for (int i = 0; i < HEAD_DIM; i++) s += qh[i] * kt[i];
-                att[t] = s * scale;
-            }
-            softmax(att, pos + 1);
-            float* out = xb + h * HEAD_DIM;
-            std::memset(out, 0, HEAD_DIM * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                const float* vt = vcache + (size_t)t * KV_DIM + kvh * HEAD_DIM;
-                const float a = att[t];
-                for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
-            }
+        for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.attn_norm, DIM);
+        mm(q, xb, L.wq, DIM, DIM, T);
+        mm(k, xb, L.wk, DIM, KV_DIM, T);
+        mm(v, xb, L.wv, DIM, KV_DIM, T);
+        for (int t = 0; t < T; t++) {
+            const float* cs = &rope_cos_[(size_t)(pos0 + t) * half];
+            const float* sn = &rope_sin_[(size_t)(pos0 + t) * half];
+            for (int h = 0; h < N_HEADS; h++)    rope(q + (size_t)t * DIM + h * HEAD_DIM, cs, sn);
+            for (int h = 0; h < N_KV_HEADS; h++) rope(k + (size_t)t * KV_DIM + h * HEAD_DIM, cs, sn);
         }
-        mm(xb2, xb, L.wo, DIM, DIM);
-        for (int i = 0; i < DIM; i++) x[i] += xb2[i];
+
+        // causal: token t (position pos0 + t) attends to positions 0..pos0 + t
+        parallel_for(T * N_HEADS, [&](int b, int e) {
+            for (int idx = b; idx < e; idx++) {
+                const int t = idx / N_HEADS, h = idx % N_HEADS, pos = pos0 + t;
+                const float* qh = q + (size_t)t * DIM + h * HEAD_DIM;
+                float* att = att_.data() + (size_t)idx * MAX_SEQ;
+                const int kvh = h / KV_MUL;
+                for (int p = 0; p <= pos; p++) {
+                    const float* kt = kcache + (size_t)p * KV_DIM + kvh * HEAD_DIM;
+                    float s = 0.0f;
+                    for (int i = 0; i < HEAD_DIM; i++) s += qh[i] * kt[i];
+                    att[p] = s * scale;
+                }
+                softmax(att, pos + 1);
+                float* out = xb + (size_t)t * DIM + h * HEAD_DIM;
+                std::memset(out, 0, HEAD_DIM * sizeof(float));
+                for (int p = 0; p <= pos; p++) {
+                    const float* vt = vcache + (size_t)p * KV_DIM + kvh * HEAD_DIM;
+                    const float a = att[p];
+                    for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
+                }
+            }
+        });
+        mm(xb2, xb, L.wo, DIM, DIM, T);
+        for (size_t i = 0; i < (size_t)T * DIM; i++) x[i] += xb2[i];
 
         // ---- SwiGLU feed-forward ----
-        rmsnorm(xb, x, L.ffn_norm, DIM);
-        mm(hb, xb, L.w_gate, DIM, HIDDEN);
-        mm(hb2, xb, L.w_up, DIM, HIDDEN);
-        for (int i = 0; i < HIDDEN; i++) hb[i] = silu(hb[i]) * hb2[i];
-        mm(xb2, hb, L.w_down, HIDDEN, DIM);
-        for (int i = 0; i < DIM; i++) x[i] += xb2[i];
+        for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.ffn_norm, DIM);
+        mm(hb, xb, L.w_gate, DIM, HIDDEN, T);
+        mm(hb2, xb, L.w_up, DIM, HIDDEN, T);
+        parallel_for(T * HIDDEN, [&](int b, int e) {
+            for (int i = b; i < e; i++) hb[i] = silu(hb[i]) * hb2[i];
+        });
+        mm(xb2, hb, L.w_down, HIDDEN, DIM, T);
+        for (size_t i = 0; i < (size_t)T * DIM; i++) x[i] += xb2[i];
     }
 
-    rmsnorm(x, x, w_.final_norm, DIM);
-    mm(logits_.data(), x, w_.lm_head, DIM, VOCAB);
+    float* last = x + (size_t)(T - 1) * DIM;
+    rmsnorm(last, last, w_.final_norm, DIM);
+    mm(logits_.data(), last, w_.lm_head, DIM, VOCAB, 1);
     return logits_.data();
 }
 

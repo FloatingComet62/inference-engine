@@ -134,6 +134,13 @@ smoke:
 	@build-tiny/tinyllama quantize --model build-tiny/models/tinyllama-f32.bin --out build-tiny/models/tinyllama-q4.bin
 	@build-tiny/tinyllama ppl --model build-tiny/models/tinyllama-q4.bin --ref-model build-tiny/models/tinyllama-f32.bin \
 	    --tokenizer build-tiny/models/tokenizer.bin --text bench/data/eval.txt --max-tokens 64 --ctx 32 | cut -c1-100
+	@for m in f32 q4; do \
+	    a=$$(build-tiny/tinyllama run --model build-tiny/models/tinyllama-$$m.bin --tokenizer build-tiny/models/tokenizer.bin \
+	        -t 0 -n 24 --ignore-eos -p "hello world" 2>/dev/null | md5sum); \
+	    b=$$(build-tiny/tinyllama run --model build-tiny/models/tinyllama-$$m.bin --tokenizer build-tiny/models/tokenizer.bin \
+	        -t 0 -n 24 --ignore-eos -p "hello world" --prefill seq --pool omp 2>/dev/null | md5sum); \
+	    [ -n "$$a" ] && [ "$$a" = "$$b" ] || { echo "batched prefill / pool output differs ($$m)"; exit 1; }; \
+	done
 	@echo "smoke test passed"
 
 clean:

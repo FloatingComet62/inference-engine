@@ -8,6 +8,7 @@
 //                                 with --ref-model also KL divergence and top-1 agreement
 //   tinyllama quantize --out F    write a Q4 (or --wtype q8) copy of an fp32 model
 #include "model.hpp"
+#include "threadpool.hpp"
 #include "sampler.hpp"
 #include "tokenizer.hpp"
 
@@ -54,6 +55,8 @@ struct Args {
     std::string ref_model;  // ppl: fp32 reference for KL divergence
     std::string out;        // quantize: output path
     std::string wtype = "q4";  // quantize: q4 | q8
+    std::string pool = "spin";     // spin (persistent pool) | omp
+    std::string prefill = "batch"; // batch | seq (token by token)
 };
 
 [[noreturn]] void usage(int code) {
@@ -74,7 +77,9 @@ struct Args {
         "  --max-tokens N      ppl: max tokens scored (default 2048)\n"
         "  --ref-model PATH    ppl: reference model for KL divergence / top-1 agreement\n"
         "  --out PATH          quantize: output file\n"
-        "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n");
+        "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n"
+        "  --pool spin|omp     thread runtime (default spin)\n"
+        "  --prefill batch|seq prompt processing (default batch)\n");
     std::exit(code);
 }
 
@@ -106,6 +111,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--ref-model") a.ref_model = val();
         else if (k == "--out") a.out = val();
         else if (k == "--wtype") a.wtype = val();
+        else if (k == "--pool") a.pool = val();
+        else if (k == "--prefill") a.prefill = val();
         else if (k == "-h" || k == "--help") usage(0);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); usage(1); }
     }
@@ -128,6 +135,8 @@ double cpu_ms_now() {
 
 // Feeds `prompt` starting at `pos`, then samples up to max_new tokens.
 // Every sampled token is fed back so the KV cache stays complete for chat.
+bool g_batch_prefill = true;
+
 Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
                const std::vector<int>& prompt, int& pos, int max_new, bool stream, bool ignore_eos) {
     Stats st;
@@ -139,7 +148,12 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
     const double cpu0 = cpu_ms_now();
     auto t0 = Clock::now();
     const float* logits = nullptr;
-    for (int t : prompt) logits = model.forward(t, pos++);
+    if (g_batch_prefill) {
+        logits = model.prefill(prompt.data(), (int)prompt.size(), pos);
+        pos += (int)prompt.size();
+    } else {
+        for (int t : prompt) logits = model.forward(t, pos++);
+    }
     st.prefill_ms = ms_since(t0);
 
     auto t1 = Clock::now();
@@ -171,21 +185,14 @@ double peak_rss_mb() {
 #endif
 }
 
-int threads_in_use() {
-#ifdef _OPENMP
-    return omp_get_max_threads();
-#else
-    return 1;
-#endif
-}
+int threads_in_use() { return tl::Parallel::get().n; }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     Args a = parse(argc, argv);
-#ifdef _OPENMP
-    if (a.threads > 0) omp_set_num_threads(a.threads);
-#endif
+    tl::Parallel::get().init(a.threads, a.pool != "omp");
+    g_batch_prefill = a.prefill != "seq";
     try {
         if (a.mode == "tokenize") {
             tl::Tokenizer tok(a.tokenizer);
