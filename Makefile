@@ -17,15 +17,17 @@ VENV         ?= .venv
 PY           := $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 
 BIN         := $(BUILD)/tinyllama
-WEIGHTS     := $(MODELS)/tinyllama-f32.bin
+WTYPE       ?= q4
+F32_WEIGHTS := $(MODELS)/tinyllama-f32.bin
+WEIGHTS     := $(MODELS)/tinyllama-$(WTYPE).bin
 TOKENIZER   := $(MODELS)/tokenizer.bin
 ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
-               --bandwidth-bin $(BUILD)/bandwidth $(if $(filter 1,$(QUALITY)),--quality)
+               --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -38,6 +40,8 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make eval          WikiText-2 perplexity + KL divergence vs fp32"
+	@echo "                     every target takes WTYPE=q4 (default) | q8 | f32"
 	@echo "  make venv          create the Python virtual environment in .venv"
 	@echo "  make rapl-perms    allow reading CPU energy counters (sudo, until reboot)"
 	@echo "  make smoke         30-second pipeline test with a toy model (no download)"
@@ -79,10 +83,17 @@ $(MODELS)/model.safetensors:
 	@echo "downloading TinyLlama-1.1B-Chat-v1.0 (about 2.2 GB)"
 	@scripts/download.sh $(MODELS)
 
-$(WEIGHTS): $(MODELS)/model.safetensors scripts/convert.py
+$(F32_WEIGHTS): $(MODELS)/model.safetensors scripts/convert.py
 	@$(PY) scripts/convert.py --model-dir $(MODELS) --out-dir $(MODELS)
 
-$(TOKENIZER): $(WEIGHTS)
+$(MODELS)/tinyllama-q4.bin $(MODELS)/tinyllama-q8.bin: $(F32_WEIGHTS) | build
+	@$(BIN) quantize --model $(F32_WEIGHTS) --out $@ --wtype $(patsubst tinyllama-%.bin,%,$(notdir $@))
+
+eval: build model
+	@$(PY) bench/eval.py --bin $(BIN) --model $(WEIGHTS) --ref-model $(F32_WEIGHTS) \
+	    --tokenizer $(TOKENIZER) --threads $(THREADS)
+
+$(TOKENIZER): $(F32_WEIGHTS)
 
 run: build model
 	@$(BIN) run $(ENGINE_ARGS) -n $(N) -t $(TEMP) -p "$(PROMPT)"
@@ -120,6 +131,9 @@ smoke:
 	    --tokenizer build-tiny/models/tokenizer.bin -p "hello world" -n 16 --ignore-eos
 	@build-tiny/tinyllama ppl --model build-tiny/models/tinyllama-f32.bin \
 	    --tokenizer build-tiny/models/tokenizer.bin --text bench/data/eval.txt --max-tokens 64 --ctx 32 | cut -c1-80
+	@build-tiny/tinyllama quantize --model build-tiny/models/tinyllama-f32.bin --out build-tiny/models/tinyllama-q4.bin
+	@build-tiny/tinyllama ppl --model build-tiny/models/tinyllama-q4.bin --ref-model build-tiny/models/tinyllama-f32.bin \
+	    --tokenizer build-tiny/models/tokenizer.bin --text bench/data/eval.txt --max-tokens 64 --ctx 32 | cut -c1-100
 	@echo "smoke test passed"
 
 clean:

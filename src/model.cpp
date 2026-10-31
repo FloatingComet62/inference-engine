@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -43,33 +44,48 @@ Model::Model(const std::string& path) {
         throw std::runtime_error("not a TLM1 weight file: " + path);
     int32_t h[8];
     std::memcpy(h, base + 4, sizeof(h));
+    const int version = h[0];
+    if (version != 1 && version != 2) throw std::runtime_error("unknown weight file version");
+    h[0] = 1;
     const int expect[8] = {1, DIM, HIDDEN, N_LAYERS, N_HEADS, N_KV_HEADS, VOCAB, MAX_SEQ};
     for (int i = 0; i < 8; i++)
         if (h[i] != expect[i])
             throw std::runtime_error("weight file does not match compiled config (re-run convert)");
 
     size_t off = HEADER_BYTES;
-    auto take = [&](size_t n) -> const float* {
+    // Version 2 stores one int8 type code per matrix after the sizes (layer order, then lm_head).
+    const int8_t* types = reinterpret_cast<const int8_t*>(base + 4 + sizeof(h));
+    int next_type = 0;
+    auto take_bytes = [&](size_t n) -> const void* {
         off = (off + ALIGN - 1) & ~(ALIGN - 1);
-        const float* p = reinterpret_cast<const float*>(base + off);
-        off += n * sizeof(float);
+        const void* p = base + off;
+        off += n;
         if (off > file_size_) throw std::runtime_error("weight file truncated");
         return p;
+    };
+    auto take = [&](size_t n) { return static_cast<const float*>(take_bytes(n * sizeof(float))); };
+    auto mat = [&](int n_out, int n_in) {
+        Mat m;
+        m.t = version == 1 ? WType::F32 : (WType)types[next_type++];
+        m.w = take_bytes(row_bytes(m.t, n_in) * n_out);
+        return m;
     };
     w_.embed = take((size_t)VOCAB * DIM);
     for (auto& L : w_.layers) {
         L.attn_norm = take(DIM);
-        L.wq        = take((size_t)DIM * DIM);
-        L.wk        = take((size_t)KV_DIM * DIM);
-        L.wv        = take((size_t)KV_DIM * DIM);
-        L.wo        = take((size_t)DIM * DIM);
+        L.wq        = mat(DIM, DIM);
+        L.wk        = mat(KV_DIM, DIM);
+        L.wv        = mat(KV_DIM, DIM);
+        L.wo        = mat(DIM, DIM);
         L.ffn_norm  = take(DIM);
-        L.w_gate    = take((size_t)HIDDEN * DIM);
-        L.w_up      = take((size_t)HIDDEN * DIM);
-        L.w_down    = take((size_t)DIM * HIDDEN);
+        L.w_gate    = mat(HIDDEN, DIM);
+        L.w_up      = mat(HIDDEN, DIM);
+        L.w_down    = mat(DIM, HIDDEN);
     }
     w_.final_norm = take(DIM);
-    w_.lm_head    = take((size_t)VOCAB * DIM);
+    w_.lm_head    = mat(VOCAB, DIM);
+    xq_.resize(HIDDEN > DIM ? HIDDEN : DIM);
+    xd_.resize(xq_.size() / QK);
 
     x_.resize(DIM); xb_.resize(DIM); xb2_.resize(DIM); q_.resize(DIM);
     att_.resize((size_t)N_HEADS * MAX_SEQ);
@@ -96,6 +112,61 @@ size_t Model::bytes_per_token() const {
     return file_size_ - HEADER_BYTES - (size_t)VOCAB * DIM * sizeof(float) + DIM * sizeof(float);
 }
 
+void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out) {
+    if (m.t == WType::F32) return matmul(out, x, static_cast<const float*>(m.w), n_in, n_out);
+    quantize_act(x, xq_.data(), xd_.data(), n_in);
+    matmul_q(out, xq_.data(), xd_.data(), m.w, m.t, n_in, n_out);
+}
+
+void Model::save_quantized(const std::string& path, WType mats, WType head) const {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot write " + path);
+    char hdr[HEADER_BYTES] = {};
+    const int32_t sizes[8] = {2, DIM, HIDDEN, N_LAYERS, N_HEADS, N_KV_HEADS, VOCAB, MAX_SEQ};
+    std::memcpy(hdr, "TLM1", 4);
+    std::memcpy(hdr + 4, sizes, sizeof(sizes));
+    int8_t* types = reinterpret_cast<int8_t*>(hdr + 4 + sizeof(sizes));
+    for (int i = 0; i < N_LAYERS * 7; i++) types[i] = (int8_t)mats;
+    types[N_LAYERS * 7] = (int8_t)head;
+    f.write(hdr, sizeof(hdr));
+
+    auto put = [&](const void* p, size_t n) {
+        const size_t pad = (ALIGN - (size_t)f.tellp() % ALIGN) % ALIGN;
+        static const char zeros[ALIGN] = {};
+        f.write(zeros, pad);
+        f.write(static_cast<const char*>(p), n);
+    };
+    auto put_mat = [&](const Mat& m, int n_out, int n_in, WType t) {
+        if (m.t != WType::F32) throw std::runtime_error("quantize needs an fp32 source model");
+        const float* w = static_cast<const float*>(m.w);
+        std::vector<char> buf(row_bytes(t, n_in) * n_out);
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < n_out; r++) {
+            char* dst = buf.data() + row_bytes(t, n_in) * r;
+            const float* src = w + (size_t)r * n_in;
+            if (t == WType::Q4) quantize_row_q4(src, reinterpret_cast<BlockQ4*>(dst), n_in);
+            else if (t == WType::Q8) quantize_row_q8(src, reinterpret_cast<BlockQ8*>(dst), n_in);
+            else std::memcpy(dst, src, n_in * sizeof(float));
+        }
+        put(buf.data(), buf.size());
+    };
+    put(w_.embed, (size_t)VOCAB * DIM * sizeof(float));
+    for (const auto& L : w_.layers) {
+        put(L.attn_norm, DIM * sizeof(float));
+        put_mat(L.wq, DIM, DIM, mats);
+        put_mat(L.wk, KV_DIM, DIM, mats);
+        put_mat(L.wv, KV_DIM, DIM, mats);
+        put_mat(L.wo, DIM, DIM, mats);
+        put(L.ffn_norm, DIM * sizeof(float));
+        put_mat(L.w_gate, HIDDEN, DIM, mats);
+        put_mat(L.w_up, HIDDEN, DIM, mats);
+        put_mat(L.w_down, DIM, HIDDEN, mats);
+    }
+    put(w_.final_norm, DIM * sizeof(float));
+    put_mat(w_.lm_head, VOCAB, DIM, head);
+    if (!f) throw std::runtime_error("write failed: " + path);
+}
+
 const float* Model::forward(int token, int pos) {
     float* x = x_.data();
     float* xb = xb_.data();
@@ -118,9 +189,9 @@ const float* Model::forward(int token, int pos) {
 
         // ---- attention ----
         rmsnorm(xb, x, L.attn_norm, DIM);
-        matmul(q, xb, L.wq, DIM, DIM);
-        matmul(k, xb, L.wk, DIM, KV_DIM);
-        matmul(v, xb, L.wv, DIM, KV_DIM);
+        mm(q, xb, L.wq, DIM, DIM);
+        mm(k, xb, L.wk, DIM, KV_DIM);
+        mm(v, xb, L.wv, DIM, KV_DIM);
         for (int h = 0; h < N_HEADS; h++)    rope(q + h * HEAD_DIM, cs, sn);
         for (int h = 0; h < N_KV_HEADS; h++) rope(k + h * HEAD_DIM, cs, sn);
 
@@ -144,20 +215,20 @@ const float* Model::forward(int token, int pos) {
                 for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
             }
         }
-        matmul(xb2, xb, L.wo, DIM, DIM);
+        mm(xb2, xb, L.wo, DIM, DIM);
         for (int i = 0; i < DIM; i++) x[i] += xb2[i];
 
         // ---- SwiGLU feed-forward ----
         rmsnorm(xb, x, L.ffn_norm, DIM);
-        matmul(hb, xb, L.w_gate, DIM, HIDDEN);
-        matmul(hb2, xb, L.w_up, DIM, HIDDEN);
+        mm(hb, xb, L.w_gate, DIM, HIDDEN);
+        mm(hb2, xb, L.w_up, DIM, HIDDEN);
         for (int i = 0; i < HIDDEN; i++) hb[i] = silu(hb[i]) * hb2[i];
-        matmul(xb2, hb, L.w_down, HIDDEN, DIM);
+        mm(xb2, hb, L.w_down, HIDDEN, DIM);
         for (int i = 0; i < DIM; i++) x[i] += xb2[i];
     }
 
     rmsnorm(x, x, w_.final_norm, DIM);
-    matmul(logits_.data(), x, w_.lm_head, DIM, VOCAB);
+    mm(logits_.data(), x, w_.lm_head, DIM, VOCAB);
     return logits_.data();
 }
 

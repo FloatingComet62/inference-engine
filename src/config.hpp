@@ -16,7 +16,7 @@ constexpr int MAX_SEQ    = 2048;   // context length
 #else
 // Toy sizes used only by `make smoke` to test the pipeline without the real model.
 constexpr int DIM        = 64;
-constexpr int HIDDEN     = 172;
+constexpr int HIDDEN     = 192;   // multiple of 32 for Q4 blocks
 constexpr int N_LAYERS   = 2;
 constexpr int N_HEADS    = 4;
 constexpr int N_KV_HEADS = 2;

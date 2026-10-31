@@ -8,7 +8,7 @@ import struct
 import sys
 from pathlib import Path
 
-D, H, L, NH, NKV, V, S = 64, 172, 2, 4, 2, 300, 128
+D, H, L, NH, NKV, V, S = 64, 192, 2, 4, 2, 300, 128
 KV = NKV * (D // NH)
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "build-tiny/models")
 out.mkdir(parents=True, exist_ok=True)

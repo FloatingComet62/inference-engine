@@ -4,7 +4,9 @@
 //   tinyllama chat                interactive multi-turn chat
 //   tinyllama bench -p "prompt"   greedy run, prints one JSON line of timings
 //   tinyllama tokenize -p "text"  print the chat-template token IDs (debugging)
-//   tinyllama ppl --text FILE     perplexity + top-1 predictions (quality check)
+//   tinyllama ppl --text FILE     perplexity + top-1 predictions (quality check);
+//                                 with --ref-model also KL divergence and top-1 agreement
+//   tinyllama quantize --out F    write a Q4 (or --wtype q8) copy of an fp32 model
 #include "model.hpp"
 #include "sampler.hpp"
 #include "tokenizer.hpp"
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
@@ -48,11 +51,14 @@ struct Args {
     std::string text;     // ppl: evaluation text file
     int ctx = 512;        // ppl: tokens per window
     int max_tokens = 2048;  // ppl: cap on scored tokens
+    std::string ref_model;  // ppl: fp32 reference for KL divergence
+    std::string out;        // quantize: output path
+    std::string wtype = "q4";  // quantize: q4 | q8
 };
 
 [[noreturn]] void usage(int code) {
     std::fprintf(stderr,
-        "usage: tinyllama <run|chat|bench|tokenize|ppl> [options]\n"
+        "usage: tinyllama <run|chat|bench|tokenize|ppl|quantize> [options]\n"
         "  --model PATH        weights file   (default models/tinyllama-f32.bin)\n"
         "  --tokenizer PATH    tokenizer file (default models/tokenizer.bin)\n"
         "  -p, --prompt TEXT   user message\n"
@@ -65,7 +71,10 @@ struct Args {
         "  --ignore-eos        always generate exactly N tokens\n"
         "  --text FILE         ppl: text to score\n"
         "  --ctx N             ppl: window length (default 512)\n"
-        "  --max-tokens N      ppl: max tokens scored (default 2048)\n");
+        "  --max-tokens N      ppl: max tokens scored (default 2048)\n"
+        "  --ref-model PATH    ppl: reference model for KL divergence / top-1 agreement\n"
+        "  --out PATH          quantize: output file\n"
+        "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n");
     std::exit(code);
 }
 
@@ -74,7 +83,7 @@ Args parse(int argc, char** argv) {
     if (argc < 2) usage(1);
     a.mode = argv[1];
     if (a.mode == "-h" || a.mode == "--help") usage(0);
-    if (a.mode != "run" && a.mode != "chat" && a.mode != "bench" && a.mode != "tokenize" && a.mode != "ppl") usage(1);
+    if (a.mode != "run" && a.mode != "chat" && a.mode != "bench" && a.mode != "tokenize" && a.mode != "ppl" && a.mode != "quantize") usage(1);
     for (int i = 2; i < argc; i++) {
         std::string k = argv[i];
         auto val = [&]() -> std::string {
@@ -94,6 +103,9 @@ Args parse(int argc, char** argv) {
         else if (k == "--text") a.text = val();
         else if (k == "--ctx") a.ctx = std::atoi(val().c_str());
         else if (k == "--max-tokens") a.max_tokens = std::atoi(val().c_str());
+        else if (k == "--ref-model") a.ref_model = val();
+        else if (k == "--out") a.out = val();
+        else if (k == "--wtype") a.wtype = val();
         else if (k == "-h" || k == "--help") usage(0);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); usage(1); }
     }
@@ -182,6 +194,13 @@ int main(int argc, char** argv) {
             std::printf("\n[%zu tokens]\n", ids.size());
             return 0;
         }
+        if (a.mode == "quantize") {
+            if (a.out.empty() || (a.wtype != "q4" && a.wtype != "q8")) usage(1);
+            tl::Model src(a.model);
+            src.save_quantized(a.out, a.wtype == "q4" ? tl::WType::Q4 : tl::WType::Q8, tl::WType::Q8);
+            std::fprintf(stderr, "wrote %s\n", a.out.c_str());
+            return 0;
+        }
         auto t_load = Clock::now();
         tl::Model model(a.model);
         tl::Tokenizer tok(a.tokenizer);
@@ -221,24 +240,48 @@ int main(int argc, char** argv) {
             auto ids = tok.encode(text, true);
             if ((int)ids.size() > a.max_tokens) ids.resize(a.max_tokens);
             const int ctx = std::max(2, std::min(a.ctx, tl::MAX_SEQ));
-            double nll = 0; int scored = 0;
+            std::unique_ptr<tl::Model> ref;
+            if (!a.ref_model.empty()) ref = std::make_unique<tl::Model>(a.ref_model);
+            // log-softmax normaliser and argmax of a logits row
+            auto lse = [](const float* l, int& arg) {
+                float mx = l[0]; arg = 0;
+                for (int v = 1; v < tl::VOCAB; v++) if (l[v] > mx) { mx = l[v]; arg = v; }
+                double sum = 0;
+                for (int v = 0; v < tl::VOCAB; v++) sum += std::exp((double)l[v] - mx);
+                return mx + std::log(sum);
+            };
+            double nll = 0, kl = 0, ref_nll = 0; int scored = 0, agree = 0;
             std::string top1;
             for (size_t start = 0; start < ids.size(); start += ctx - 1) {
                 const float* logits = model.forward(tl::BOS, 0);
+                const float* rlog = ref ? ref->forward(tl::BOS, 0) : nullptr;
                 for (int p = 0; p < ctx - 1 && start + p < ids.size(); p++) {
                     const int target = ids[start + p];
-                    float mx = logits[0]; int arg = 0;
-                    for (int v = 1; v < tl::VOCAB; v++) if (logits[v] > mx) { mx = logits[v]; arg = v; }
-                    double sum = 0;
-                    for (int v = 0; v < tl::VOCAB; v++) sum += std::exp((double)logits[v] - mx);
-                    nll += std::log(sum) + mx - logits[target];
+                    int arg;
+                    const double z = lse(logits, arg);
+                    nll += z - logits[target];
+                    if (ref) {   // KL(P_ref || P) over the full vocabulary
+                        int rarg;
+                        const double rz = lse(rlog, rarg);
+                        ref_nll += rz - rlog[target];
+                        agree += rarg == arg;
+                        for (int v = 0; v < tl::VOCAB; v++) {
+                            const double lr = rlog[v] - rz;
+                            kl += std::exp(lr) * (lr - (logits[v] - z));
+                        }
+                        rlog = ref->forward(target, p + 1);
+                    }
                     scored++;
                     top1 += (top1.empty() ? "" : ",") + std::to_string(arg);
                     logits = model.forward(target, p + 1);
                 }
             }
-            std::printf("{\"tokens\": %d, \"nll\": %.6f, \"ppl\": %.4f, \"top1\": [%s]}\n",
-                        scored, nll / scored, std::exp(nll / scored), top1.c_str());
+            std::printf("{\"tokens\": %d, \"nll\": %.6f, \"ppl\": %.4f", scored, nll / scored,
+                        std::exp(nll / scored));
+            if (ref)
+                std::printf(", \"ref_ppl\": %.4f, \"kl\": %.6f, \"top1_agree\": %.4f",
+                            std::exp(ref_nll / scored), kl / scored, (double)agree / scored);
+            std::printf(", \"top1\": [%s]}\n", top1.c_str());
         } else {  // bench
             auto prompt = tok.encode_first_turn(a.system, a.prompt);
             Stats s = generate(model, tok, sampler, prompt, pos, a.n, false, a.ignore_eos);
