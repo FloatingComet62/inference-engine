@@ -60,6 +60,9 @@ private:
     const float* forward_batch(const int* tokens, int T, int pos);
     // out[T][n_out] = x[T][n_in] . W^T
     void mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T);
+    void quant_act(const float* x, const Mat& m, int n_in, int T);
+    void mm_rows(float* out, int ldo, const float* x, const Mat& m, int n_in, int b, int e, int T);
+    void mm_residual(float* x, const float* in, const Mat& m, int n_in, int T);
     std::vector<int8_t> xq_;   // quantised activations for mm()
     std::vector<float> xd_;
     std::vector<int32_t> xs_;  // per-block Q4 zero-point correction (-8 * group sums)
