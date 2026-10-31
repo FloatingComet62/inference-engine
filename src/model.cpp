@@ -127,31 +127,37 @@ size_t Model::bytes_per_token() const {
 // prefill register tile: 2 rows x 4 tokens measured best (2x4, 3x4, 4x4 within noise; 4x2 slower)
 static constexpr int TR = 2, TC = 4;
 
-void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T) {
+// Quantise T activation rows of length n_in into xq_/xd_/xs_ (no-op for fp32 weights).
+void Model::quant_act(const float* x, const Mat& m, int n_in, int T) {
+    if (m.t == WType::F32) return;
+    const int nb = n_in / QK;
+    auto quant = [&](int b, int e) {
+        for (int t = b; t < e; t++)
+            quantize_act(x + (size_t)t * n_in, xq_.data() + (size_t)t * n_in, xd_.data() + t * nb, n_in,
+                         xs_.data() + (size_t)t * nb * 8);
+    };
+    if (T == 1) quant(0, 1); else parallel_for(T, quant);
+}
+
+// Rows [b, e) of out = W.x for all T tokens; out row stride (per token) is ldo.
+// Expects quant_act() already run for x. Called from inside parallel_for workers, so
+// several matrices / epilogues can share one dispatch (see forward_batch).
+void Model::mm_rows(float* out, int ldo, const float* x, const Mat& m, int n_in, int b, int e, int T) {
     if (m.t == WType::F32) {
         const float* W = static_cast<const float*>(m.w);
-        parallel_for(n_out, [&](int b, int e) {
-            for (int i = b; i < e; i++)
-                for (int t = 0; t < T; t++)
-                    out[(size_t)t * n_out + i] = dot_f32(W + (size_t)i * n_in, x + (size_t)t * n_in, n_in);
-        });
+        for (int i = b; i < e; i++)
+            for (int t = 0; t < T; t++)
+                out[(size_t)t * ldo + i] = dot_f32(W + (size_t)i * n_in, x + (size_t)t * n_in, n_in);
         return;
     }
     const int nb = n_in / QK;
-    int8_t* xq = xq_.data();
-    float* xd = xd_.data();
-    int32_t* xs = xs_.data();
-    auto quant = [&](int b, int e) {
-        for (int t = b; t < e; t++)
-            quantize_act(x + (size_t)t * n_in, xq + (size_t)t * n_in, xd + t * nb, n_in, xs + (size_t)t * nb * 8);
-    };
-    if (T == 1) quant(0, 1); else parallel_for(T, quant);
+    const int8_t* xq = xq_.data();
+    const float* xd = xd_.data();
+    const int32_t* xs = xs_.data();
     if (T == 1) {   // decode: one dot product per row
-        parallel_for(n_out, [&](int b, int e) {
-            for (int i = b; i < e; i++)
-                out[i] = m.t == WType::Q4 ? dot_q4(static_cast<const BlockQ4*>(m.w) + (size_t)i * nb, xq, xd, xs, nb)
-                                          : dot_q8(static_cast<const BlockQ8*>(m.w) + (size_t)i * nb, xq, xd, nb);
-        });
+        for (int i = b; i < e; i++)
+            out[i] = m.t == WType::Q4 ? dot_q4(static_cast<const BlockQ4*>(m.w) + (size_t)i * nb, xq, xd, xs, nb)
+                                      : dot_q8(static_cast<const BlockQ8*>(m.w) + (size_t)i * nb, xq, xd, nb);
         return;
     }
     // prefill: TR rows x TC tokens register tiles; remainders use narrower tiles
@@ -161,24 +167,39 @@ void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, in
             const auto* row = W + (size_t)i * nb;
             int t = 0;
             auto at = [&](int t) { return std::make_tuple(xq + (size_t)t * n_in, xd + t * nb, xs + (size_t)t * nb * 8,
-                                                         out + (size_t)t * n_out + i); };
+                                                         out + (size_t)t * ldo + i); };
             for (; t + TC <= T; t += TC) {
                 auto [a, d, c, o] = at(t);
-                dot_tile<r, TC>(row, a, d, c, nb, o, n_out);
+                dot_tile<r, TC>(row, a, d, c, nb, o, ldo);
             }
             for (; t < T; t++) {
                 auto [a, d, c, o] = at(t);
-                dot_tile<r, 1>(row, a, d, c, nb, o, n_out);
+                dot_tile<r, 1>(row, a, d, c, nb, o, ldo);
             }
         };
-        parallel_for(n_out, [&](int b, int e) {
-            int i = b;
-            for (; i + TR <= e; i += TR) col(std::integral_constant<int, TR>{}, i);
-            for (; i < e; i++) col(std::integral_constant<int, 1>{}, i);
-        });
+        int i = b;
+        for (; i + TR <= e; i += TR) col(std::integral_constant<int, TR>{}, i);
+        for (; i < e; i++) col(std::integral_constant<int, 1>{}, i);
     };
     if (m.t == WType::Q4) rows(static_cast<const BlockQ4*>(m.w));
     else rows(static_cast<const BlockQ8*>(m.w));
+}
+
+void Model::mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T) {
+    quant_act(x, m, n_in, T);
+    parallel_for(n_out, [&](int b, int e) { mm_rows(out, n_out, x, m, n_in, b, e, T); });
+}
+
+// x += W.in, with the residual add folded into the matmul epilogue (each worker adds
+// its own rows; same x + dot as a separate pass, so results are unchanged).
+void Model::mm_residual(float* x, const float* in, const Mat& m, int n_in, int T) {
+    float* tmp = xb2_.data();
+    quant_act(in, m, n_in, T);
+    parallel_for(DIM, [&](int b, int e) {
+        mm_rows(tmp, DIM, in, m, n_in, b, e, T);
+        for (int t = 0; t < T; t++)
+            for (int i = b; i < e; i++) x[(size_t)t * DIM + i] += tmp[(size_t)t * DIM + i];
+    });
 }
 
 const float* Model::prefill(const int* tokens, int n, int pos) {
@@ -249,7 +270,6 @@ void Model::save_quantized(const std::string& path, WType mats, WType head) cons
 const float* Model::forward_batch(const int* tokens, int T, int pos0) {
     float* x = x_.data();
     float* xb = xb_.data();
-    float* xb2 = xb2_.data();
     float* q = q_.data();
     float* hb = hb_.data();
     float* hb2 = hb2_.data();
@@ -277,9 +297,18 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
 
         // ---- attention ----
         for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.attn_norm, DIM);
-        mm(q, xb, L.wq, DIM, DIM, T);
-        mm(k_tmp_.data(), xb, L.wk, DIM, KV_DIM, T);
-        mm(v_tmp_.data(), xb, L.wv, DIM, KV_DIM, T);
+        // Q, K and V in one dispatch over their concatenated rows, sharing one activation
+        // quantisation (all three take xb). Each row's dot product is unchanged.
+        quant_act(xb, L.wq, DIM, T);
+        parallel_for(DIM + 2 * KV_DIM, [&](int b, int e) {
+            auto seg = [&](float* out, int ld, const Mat& m, int lo) {   // rows [lo, lo+ld) of the concat
+                const int sb = b > lo ? b - lo : 0, se = e - lo < ld ? e - lo : ld;
+                if (sb < se) mm_rows(out, ld, xb, m, DIM, sb, se, T);
+            };
+            seg(q, DIM, L.wq, 0);
+            seg(k_tmp_.data(), KV_DIM, L.wk, DIM);
+            seg(v_tmp_.data(), KV_DIM, L.wv, DIM + KV_DIM);
+        });
         for (int t = 0; t < T; t++) {
             const int qpos = rebased ? cap - 1 : pos0 + t;
             for (int h = 0; h < N_HEADS; h++)
@@ -312,18 +341,23 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
                             att_.data() + (size_t)idx * MAX_SEQ);
             }
         });
-        mm(xb2, xb, L.wo, DIM, DIM, T);
-        for (size_t i = 0; i < (size_t)T * DIM; i++) x[i] += xb2[i];
+        mm_residual(x, xb, L.wo, DIM, T);
 
         // ---- SwiGLU feed-forward ----
         for (int t = 0; t < T; t++) rmsnorm(xb + (size_t)t * DIM, x + (size_t)t * DIM, L.ffn_norm, DIM);
-        mm(hb, xb, L.w_gate, DIM, HIDDEN, T);
-        mm(hb2, xb, L.w_up, DIM, HIDDEN, T);
-        parallel_for(T * HIDDEN, [&](int b, int e) {
-            for (int i = b; i < e; i++) hb[i] = silu(hb[i]) * hb2[i];
+        // gate and up in one dispatch: each worker computes matching gate/up rows and
+        // applies SwiGLU in the epilogue (no separate silu pass, one barrier fewer).
+        quant_act(xb, L.w_gate, DIM, T);
+        parallel_for(HIDDEN, [&](int b, int e) {
+            mm_rows(hb, HIDDEN, xb, L.w_gate, DIM, b, e, T);
+            mm_rows(hb2, HIDDEN, xb, L.w_up, DIM, b, e, T);
+            for (int t = 0; t < T; t++)
+                for (int i = b; i < e; i++) {
+                    const size_t k = (size_t)t * HIDDEN + i;
+                    hb[k] = silu(hb[k]) * hb2[k];
+                }
         });
-        mm(xb2, hb, L.w_down, HIDDEN, DIM, T);
-        for (size_t i = 0; i < (size_t)T * DIM; i++) x[i] += xb2[i];
+        mm_residual(x, hb, L.w_down, HIDDEN, T);
     }
 
     work_valid_ = rebased ? 0 : n_ctx;
