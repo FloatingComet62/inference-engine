@@ -5,12 +5,13 @@
 // KVCache abstracts *where and how* those rows live so caching algorithms can
 // be swapped and compared without touching the forward pass.
 //
-// Intended implementations (only BaselineKVCache exists today):
-//   BaselineKVCache  flat per-layer arrays, no eviction        [kv_cache.cpp]
-//   PagedBlocks      fixed-size token blocks + block tables (vLLM style)
-//   FreeOnFinish     drop a sequence's rows when it ends
-//   PrefixCaching    content-keyed reuse of stored prefixes (skip prefill)
-//   BoundedGrowth    capacity cap with an eviction policy
+// Implementations (both live in kv_cache.cpp):
+//   BaselineKVCache  flat per-layer arrays, no eviction
+//   PagedKVCache     fixed-size token blocks + block tables (vLLM style;
+//                    the engine default)
+// Planned: FreeOnFinish (drop a sequence's rows when it ends), PrefixCaching
+// (content-keyed reuse of stored prefixes, skip prefill), BoundedGrowth
+// (capacity cap with an eviction policy).
 //
 // Contracts (implementations must honour; the engine relies on them):
 //   * A row is KV_DIM contiguous floats. The returned pointer stays valid
@@ -114,6 +115,69 @@ private:
     };
     std::unordered_map<SeqId, Seq> seqs_;
     SeqId next_ = 0;
+    mutable size_t row_fetches_ = 0, prefix_checks_ = 0, prefix_hits_ = 0;
+};
+
+// Paged backend (vLLM PagedAttention style, SOSP'23): the KV cache is a fixed
+// pool of physical blocks; each sequence maps its logical blocks to physical
+// ones through a block table, so token positions are never assumed physically
+// contiguous. Blocks are allocated lazily — begin_sequence() allocates
+// nothing; store() grabs a block on demand — and released to the pool when a
+// sequence ends. One block holds all layers (keys/values are
+// [N_LAYERS][BLOCK_SIZE][KV_DIM] floats), which is what store() must be told
+// in layer-major order but writes into the same block.
+//
+// Behavioural notes:
+//   * capacity_tokens() = BLOCK_SIZE * pool_blocks (default: MAX_SEQ).
+//   * store() throws std::runtime_error when the pool is exhausted (no
+//     eviction yet; positions < stored_tokens stay readable by contract).
+//   * Row pointers returned by key_row/value_row stay valid while the owning
+//     sequence lives; a block's storage is fixed at first allocation and only
+//     freed when the pool reuses it after end_sequence()/clear().
+//   * key_row/value_row return nullptr for positions >= stored_tokens (never
+//     read by the engine) or out-of-range layers; unknown sequences throw.
+class PagedKVCache : public KVCache {
+public:
+    static constexpr int BLOCK_SIZE = 16;
+    static constexpr int DEFAULT_POOL_BLOCKS = MAX_SEQ / BLOCK_SIZE;
+
+    explicit PagedKVCache(int pool_blocks = DEFAULT_POOL_BLOCKS);
+
+    SeqId begin_sequence() override;
+    void end_sequence(SeqId seq) override;
+    void clear() override;
+
+    void store(SeqId seq, int layer, int pos, int token,
+               const float* k_row, const float* v_row) override;
+    const float* key_row(SeqId seq, int layer, int pos) const override;
+    const float* value_row(SeqId seq, int layer, int pos) const override;
+    int stored_tokens(SeqId seq) const override;
+
+    int longest_cached_prefix(SeqId seq, const int* tokens, int n) const override;
+
+    size_t capacity_tokens() const override;
+    size_t used_tokens() const override;
+    KVCacheStats stats() const override;
+
+private:
+    struct PhysicalBlock {
+        std::vector<float> keys, values;  // [N_LAYERS][BLOCK_SIZE][KV_DIM]
+        int ref_count = 0;                // 1 while owned; 0 -> released
+    };
+    struct BlockEntry {
+        int physical_block_id;
+        int filled;    // tokens stored in this block's [0, filled)
+    };
+    struct Seq {
+        std::vector<BlockEntry> blocks;   // logical block table
+        std::vector<int> ids;             // token per position, for prefix checks
+        int len = 0;                      // positions stored so far
+    };
+    std::vector<PhysicalBlock> blocks_;  // fixed pool, sized at construction
+    std::vector<int> free_blocks_;       // pool ids available
+    std::unordered_map<SeqId, Seq> seqs_;
+    SeqId next_ = 0;
+    size_t allocated_blocks_ = 0;        // for stats().bytes
     mutable size_t row_fetches_ = 0, prefix_checks_ = 0, prefix_hits_ = 0;
 };
 

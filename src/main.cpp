@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         auto t_load = Clock::now();
-        tl::BaselineKVCache kv_cache;  // swap algorithms here for experiments
+        tl::PagedKVCache kv_cache;  // paged blocks; baseline lives in kv_cache.cpp for A/B
         tl::Model model(a.model, kv_cache);
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);

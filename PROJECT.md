@@ -21,7 +21,7 @@ State: baseline works end-to-end (real weights downloaded in `models/`,
 | --- | --- |
 | `src/config.hpp` | All model sizes as compile-time constants. `TL_TINY_TEST` switches to toy sizes. |
 | `src/kernels.hpp` | `matmul`, `rmsnorm`, `softmax`, `silu`. **Optimise here first.** |
-| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface + `BaselineKVCache` (flat arrays, no eviction). The four experiment algorithms plug in here. |
+| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface; `PagedKVCache` (engine default) + `BaselineKVCache` (A/B). Further experiments plug in here. |
 | `src/model.cpp` | mmap weight loading, forward pass (uses a `KVCache&`), RoPE cache. |
 | `src/tokenizer.hpp/.cpp` | SentencePiece-style BPE + Zephyr template. |
 | `src/sampler.hpp` | greedy / temperature / top-p. |
@@ -138,12 +138,27 @@ cores via `scripts/physical_cores.sh`), `N`, `RUNS`, `TEMP`, `PROMPT`, `BUILD`.
 ## KV cache experiments (in progress)
 
 `src/kv_cache.hpp` defines the interface (per-token rows, sequence handles,
-content-keyed prefix API, capacity + stats); `BaselineKVCache` is the engine's
-old flat arrays relocated. To add an algorithm: subclass `KVCache`, implement
-storage + `longest_cached_prefix`/`stored_tokens`/capacity honestly (see header
-contracts), and construct it in `src/main.cpp` where the baseline is created.
+content-keyed prefix API, capacity + stats). Two backends live in
+`src/kv_cache.cpp`:
+
+- **`PagedKVCache`** — engine default. vLLM-style (PagedAttention, SOSP'23):
+  fixed pool of physical blocks (`BLOCK_SIZE=16` tokens, all layers per block),
+  per-sequence logical block tables, lazy allocation, blocks released to the
+  pool on `end_sequence`. `capacity_tokens() = BLOCK_SIZE * pool_blocks`
+  (default `MAX_SEQ` = 2048). Pool exhaustion makes `store()` throw — no
+  eviction yet, and none is safe until the engine can re-prefill gaps.
+  `key_row()`/`value_row()` return `nullptr` for positions ≥ `stored_tokens`.
+- **`BaselineKVCache`** — flat per-sequence `[N_LAYERS][MAX_SEQ][KV_DIM]`
+  arrays, kept for A/B; swap back at the single construction site in
+  `src/main.cpp`.
+
+Remaining experiments: `FreeOnFinish` (drop rows at end), `PrefixCaching`
+(content-keyed re-use, skip prefill), `BoundedGrowth` (eviction under a cap).
 Note: real cross-request prefix caching needs the engine to consult
 `longest_cached_prefix` in `generate()` before prefilling — not wired yet.
+Memory benefit of paging: peak allocation tracks stored tokens (a full real
+context caps at `MAX_SEQ/BLOCK_SIZE = 128` blocks × 5.8 MB ≈ 738 MB, same
+ceiling as baseline but only reached when actually used).
 
 ## Planned next steps (from PLAN.md, in priority order)
 
