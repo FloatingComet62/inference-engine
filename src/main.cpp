@@ -63,6 +63,8 @@ struct Args {
     std::string cache = "radix";  // baseline|paged|radix|streaming
     int window = tl::MAX_SEQ;     // streaming: window tokens (incl. sinks)
     int sinks = 4;                // streaming: attention-sink tokens
+    std::string spec = "off";     // speculative decoding: off | ngram (greedy only)
+    int draft_k = 4;              // spec: max drafted tokens per verification
 };
 
 [[noreturn]] void usage(int code) {
@@ -91,7 +93,9 @@ struct Args {
         "  --cache NAME        kv cache backend: baseline|paged|radix|streaming\n"
         "                      (default radix)\n"
         "  --window N          streaming: window tokens incl. sinks (default 2048)\n"
-        "  --sinks N           streaming: attention-sink tokens (default 4)\n");
+        "  --sinks N           streaming: attention-sink tokens (default 4)\n"
+        "  --spec off|ngram    speculative decoding by prompt lookup (greedy -t 0 only)\n"
+        "  --draft-k K         spec: max drafted tokens per verification (default 4)\n");
     std::exit(code);
 }
 
@@ -129,10 +133,15 @@ Args parse(int argc, char** argv) {
         else if (k == "--kv") a.kv = val();
         else if (k == "--window") a.window = std::atoi(val().c_str());
         else if (k == "--sinks") a.sinks = std::atoi(val().c_str());
+        else if (k == "--spec") a.spec = val();
+        else if (k == "--draft-k") a.draft_k = std::atoi(val().c_str());
         else if (k == "-h" || k == "--help") usage(0);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); usage(1); }
     }
     if (a.mode == "bench") a.temp = 0.0f;
+    if (a.spec != "off" && a.spec != "ngram") usage(1);
+    if (a.draft_k < 1) a.draft_k = 1;
+    if (a.draft_k > tl::PREFILL_CHUNK - 1) a.draft_k = tl::PREFILL_CHUNK - 1;
     return a;
 }
 
@@ -141,6 +150,7 @@ struct Stats {
     double prefill_ms = 0, decode_ms = 0;
     double ttft_ms = 0;   // prompt in -> first token sampled
     double cpu_ms = 0;    // user+sys CPU time over prefill+decode, all threads
+    int verifies = 0, drafted = 0, accepted = 0;   // speculative decoding counters
 };
 
 double cpu_ms_now() {
@@ -152,6 +162,23 @@ double cpu_ms_now() {
 // Feeds `prompt` starting at `pos`, then samples up to max_new tokens.
 // Every sampled token is fed back so the KV cache stays complete for chat.
 bool g_batch_prefill = true;
+int g_draft_k = 0;
+int g_cache_cap = tl::MAX_SEQ;   // spec: never verify across a streaming re-base   // > 0: greedy speculative decoding with prompt-lookup drafts
+
+// Prompt-lookup draft: find the most recent earlier occurrence of the last n tokens
+// of `h` (n = 3, then 2) and propose up to k tokens that followed it.
+void ngram_draft(const std::vector<int>& h, int k, std::vector<int>& out) {
+    out.clear();
+    const int L = (int)h.size();
+    for (int n = 3; n >= 2; n--) {
+        if (L < n + 1) continue;
+        for (int i = L - n - 1; i >= 0; i--) {
+            if (!std::equal(h.end() - n, h.end(), h.begin() + i)) continue;
+            for (int j = i + n; j < L && (int)out.size() < k; j++) out.push_back(h[j]);
+            return;
+        }
+    }
+}
 
 Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
                const std::vector<int>& prompt, int& pos, int max_new, bool stream, bool ignore_eos) {
@@ -173,6 +200,56 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
     st.prefill_ms = ms_since(t0);
 
     auto t1 = Clock::now();
+    auto emit = [&](int t) {
+        st.gen_tokens++;
+        if (!stream) return;
+        std::string piece = tok.decode(t);
+        if (st.gen_tokens == 1 && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+        std::fflush(stdout);
+    };
+    if (g_draft_k > 0) {
+        // Greedy speculative decoding. `next` is the model's token for position pos.
+        // Feed [next, d1..dk] at pos..pos+k in one batch: row i's argmax is the model's
+        // token after input i, so d_{i+1} is accepted while it equals row i's argmax, and
+        // the first mismatching row (or row k) gives the next token for free. Rejected
+        // positions' KV rows are overwritten later (the cache is position-indexed).
+        std::vector<int> hist(prompt), draft, in;
+        int next = sampler.sample(logits);
+        st.ttft_ms = ms_since(t0);
+        while (true) {
+            if (next == tl::EOS && !ignore_eos) break;
+            if (st.gen_tokens >= max_new || pos >= tl::MAX_SEQ) break;
+            emit(next);
+            hist.push_back(next);
+            const int room = std::min({max_new - st.gen_tokens, tl::MAX_SEQ - pos - 1, g_cache_cap - pos - 1});
+            ngram_draft(hist, std::min(g_draft_k, room), draft);
+            if (draft.empty()) {
+                next = sampler.sample(model.forward(next, pos++));
+                continue;
+            }
+            in.assign(1, next);
+            in.insert(in.end(), draft.begin(), draft.end());
+            const float* rows = model.forward_all(in.data(), (int)in.size(), pos);
+            st.verifies++; st.drafted += (int)draft.size();
+            int m = 0;
+            while (m < (int)draft.size() && sampler.sample(rows + (size_t)m * tl::VOCAB) == draft[m]) m++;
+            st.accepted += m;
+            next = sampler.sample(rows + (size_t)m * tl::VOCAB);
+            pos += 1 + m;
+            // emit accepted drafts (each was the model's own greedy choice)
+            bool stop = false;
+            for (int i = 0; i < m && !stop; i++) {
+                if (draft[i] == tl::EOS && !ignore_eos) { stop = true; break; }
+                emit(draft[i]);
+                hist.push_back(draft[i]);
+            }
+            if (stop) break;
+        }
+        st.decode_ms = ms_since(t1);
+        st.cpu_ms = cpu_ms_now() - cpu0;
+        return st;
+    }
     while (st.gen_tokens < max_new && pos < tl::MAX_SEQ) {
         int next = sampler.sample(logits);
         if (st.ttft_ms == 0) st.ttft_ms = ms_since(t0);
@@ -252,6 +329,9 @@ int main(int argc, char** argv) {
                                      " (baseline|paged|radix|streaming)");
         else kv_cache = std::make_unique<tl::RadixKVCache>();  // default: prefix reuse
         tl::Model model(a.model, *kv_cache, a.kv == "q8");
+        g_cache_cap = (int)kv_cache->capacity_tokens();
+        // temperature > 0 falls back to normal decoding (no rejection sampling)
+        if (a.spec == "ngram" && a.temp <= 0.0f) g_draft_k = a.draft_k;
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);
         tl::Sampler sampler(a.temp, a.top_p, a.seed);
@@ -344,12 +424,19 @@ int main(int argc, char** argv) {
                         "\"load_ms\": %.1f, \"prefill_ms\": %.1f, \"decode_ms\": %.1f, "
                         "\"prefill_tps\": %.3f, \"decode_tps\": %.3f, \"threads\": %d, "
                         "\"bytes_per_token\": %zu, \"peak_rss_mb\": %.1f, \"ttft_ms\": %.1f, "
-                        "\"cpu_ms\": %.1f, \"cpu_util_pct\": %.1f}\n",
+                        "\"cpu_ms\": %.1f, \"cpu_util_pct\": %.1f",
                         s.prompt_tokens, s.gen_tokens, load_ms, s.prefill_ms, s.decode_ms,
                         s.prompt_tokens / (s.prefill_ms / 1000.0),
                         s.gen_tokens > 0 ? s.gen_tokens / (s.decode_ms / 1000.0) : 0.0,
                         threads_in_use(), model.bytes_per_token(), peak_rss_mb(), s.ttft_ms,
                         s.cpu_ms, 100.0 * s.cpu_ms / (s.prefill_ms + s.decode_ms));
+            if (g_draft_k > 0)
+                std::printf(", \"spec_verifies\": %d, \"spec_drafted\": %d, \"spec_accepted\": %d, "
+                            "\"accepted_per_verify\": %.3f, \"acceptance_rate\": %.3f",
+                            s.verifies, s.drafted, s.accepted,
+                            s.verifies ? (double)s.accepted / s.verifies : 0.0,
+                            s.drafted ? (double)s.accepted / s.drafted : 0.0);
+            std::printf("}\n");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
