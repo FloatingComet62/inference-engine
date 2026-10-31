@@ -27,7 +27,7 @@ inline void rope(float* v, const float* cs, const float* sn) {
 }
 }  // namespace
 
-Model::Model(const std::string& path) {
+Model::Model(const std::string& path, KVCache& cache) : cache_(&cache) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open weights: " + path + " (run `make setup`)");
     struct stat st{};
@@ -74,8 +74,9 @@ Model::Model(const std::string& path) {
     x_.resize(DIM); xb_.resize(DIM); xb2_.resize(DIM); q_.resize(DIM);
     att_.resize((size_t)N_HEADS * MAX_SEQ);
     hb_.resize(HIDDEN); hb2_.resize(HIDDEN); logits_.resize(VOCAB);
-    key_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
-    value_cache_.resize((size_t)N_LAYERS * MAX_SEQ * KV_DIM);
+    k_tmp_.resize(KV_DIM); v_tmp_.resize(KV_DIM);
+    k_rows_.resize(MAX_SEQ); v_rows_.resize(MAX_SEQ);
+    seq_ = cache_->begin_sequence();
 
     constexpr int half = HEAD_DIM / 2;
     rope_cos_.resize((size_t)MAX_SEQ * half);
@@ -89,6 +90,7 @@ Model::Model(const std::string& path) {
 }
 
 Model::~Model() {
+    if (cache_) cache_->end_sequence(seq_);
     if (map_) munmap(map_, file_size_);
 }
 
@@ -111,18 +113,21 @@ const float* Model::forward(int token, int pos) {
 
     for (int l = 0; l < N_LAYERS; l++) {
         const LayerWeights& L = w_.layers[l];
-        float* kcache = key_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        float* vcache = value_cache_.data() + (size_t)l * MAX_SEQ * KV_DIM;
-        float* k = kcache + (size_t)pos * KV_DIM;
-        float* v = vcache + (size_t)pos * KV_DIM;
 
         // ---- attention ----
         rmsnorm(xb, x, L.attn_norm, DIM);
         matmul(q, xb, L.wq, DIM, DIM);
-        matmul(k, xb, L.wk, DIM, KV_DIM);
-        matmul(v, xb, L.wv, DIM, KV_DIM);
+        matmul(k_tmp_.data(), xb, L.wk, DIM, KV_DIM);
+        matmul(v_tmp_.data(), xb, L.wv, DIM, KV_DIM);
         for (int h = 0; h < N_HEADS; h++)    rope(q + h * HEAD_DIM, cs, sn);
-        for (int h = 0; h < N_KV_HEADS; h++) rope(k + h * HEAD_DIM, cs, sn);
+        for (int h = 0; h < N_KV_HEADS; h++) rope(k_tmp_.data() + h * HEAD_DIM, cs, sn);
+        cache_->store(seq_, l, pos, token, k_tmp_.data(), v_tmp_.data());
+
+        // Per-position row pointers (single-threaded; the parallel loop only reads).
+        for (int t = 0; t <= pos; t++) {
+            k_rows_[t] = cache_->key_row(seq_, l, t);
+            v_rows_[t] = cache_->value_row(seq_, l, t);
+        }
 
 #pragma omp parallel for schedule(static)
         for (int h = 0; h < N_HEADS; h++) {
@@ -130,7 +135,7 @@ const float* Model::forward(int token, int pos) {
             float* att = att_.data() + (size_t)h * MAX_SEQ;
             const int kvh = h / KV_MUL;
             for (int t = 0; t <= pos; t++) {
-                const float* kt = kcache + (size_t)t * KV_DIM + kvh * HEAD_DIM;
+                const float* kt = k_rows_[t] + kvh * HEAD_DIM;
                 float s = 0.0f;
                 for (int i = 0; i < HEAD_DIM; i++) s += qh[i] * kt[i];
                 att[t] = s * scale;
@@ -139,7 +144,7 @@ const float* Model::forward(int token, int pos) {
             float* out = xb + h * HEAD_DIM;
             std::memset(out, 0, HEAD_DIM * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                const float* vt = vcache + (size_t)t * KV_DIM + kvh * HEAD_DIM;
+                const float* vt = v_rows_[t] + kvh * HEAD_DIM;
                 const float a = att[t];
                 for (int i = 0; i < HEAD_DIM; i++) out[i] += a * vt[i];
             }

@@ -5,6 +5,7 @@
 //   tinyllama bench -p "prompt"   greedy run, prints one JSON line of timings
 //   tinyllama tokenize -p "text"  print the chat-template token IDs (debugging)
 //   tinyllama ppl --text FILE     perplexity + top-1 predictions (quality check)
+#include "kv_cache.hpp"
 #include "model.hpp"
 #include "sampler.hpp"
 #include "tokenizer.hpp"
@@ -183,7 +184,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         auto t_load = Clock::now();
-        tl::Model model(a.model);
+        tl::BaselineKVCache kv_cache;  // swap algorithms here for experiments
+        tl::Model model(a.model, kv_cache);
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);
         tl::Sampler sampler(a.temp, a.top_p, a.seed);

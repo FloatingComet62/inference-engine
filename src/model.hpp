@@ -1,5 +1,6 @@
 #pragma once
 #include "config.hpp"
+#include "kv_cache.hpp"
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -20,7 +21,9 @@ struct Weights {
 
 class Model {
 public:
-    explicit Model(const std::string& path);
+    // `cache` must outlive the Model; the model occupies one sequence in it.
+    // A new Model always starts a fresh sequence (the cache may keep others).
+    Model(const std::string& path, KVCache& cache);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -38,8 +41,12 @@ private:
     Weights w_{};
 
     std::vector<float> x_, xb_, xb2_, q_, att_, hb_, hb2_, logits_;
-    std::vector<float> key_cache_, value_cache_;   // [N_LAYERS][MAX_SEQ][KV_DIM]
+    std::vector<float> k_tmp_, v_tmp_;             // [KV_DIM] freshly computed rows
+    std::vector<const float*> k_rows_, v_rows_;    // row pointers for pos 0..pos
     std::vector<float> rope_cos_, rope_sin_;       // [MAX_SEQ][HEAD_DIM/2]
+
+    KVCache* cache_ = nullptr;
+    SeqId seq_ = -1;
 };
 
 }  // namespace tl
