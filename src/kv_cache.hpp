@@ -5,13 +5,12 @@
 // KVCache abstracts *where and how* those rows live so caching algorithms can
 // be swapped and compared without touching the forward pass.
 //
-// Implementations (both live in kv_cache.cpp):
+// Implementations (all live in kv_cache.cpp):
 //   BaselineKVCache  flat per-layer arrays, no eviction
-//   PagedKVCache     fixed-size token blocks + block tables (vLLM style;
-//                    the engine default)
-// Planned: FreeOnFinish (drop a sequence's rows when it ends), PrefixCaching
-// (content-keyed reuse of stored prefixes, skip prefill), BoundedGrowth
-// (capacity cap with an eviction policy).
+//   PagedKVCache     fixed-size token blocks + block tables (vLLM style)
+//   RadixKVCache     global radix tree of token prefixes + shared KV pages,
+//                    LRU leaf eviction (RadixAttention, the engine default)
+// Planned: FreeOnFinish (drop a sequence's rows when it ends), BoundedGrowth.
 //
 // Contracts (implementations must honour; the engine relies on them):
 //   * A row is KV_DIM contiguous floats. The returned pointer stays valid
@@ -36,6 +35,9 @@
 #include "config.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -178,6 +180,141 @@ private:
     std::unordered_map<SeqId, Seq> seqs_;
     SeqId next_ = 0;
     size_t allocated_blocks_ = 0;        // for stats().bytes
+    mutable size_t row_fetches_ = 0, prefix_checks_ = 0, prefix_hits_ = 0;
+};
+
+// RadixAttention (SGLang, arXiv:2312.07104) KV cache: a global compressed
+// radix tree of token prefixes; the KV rows of a matched prefix are *shared*
+// physical pages, so sequences never duplicate KV for an identical prefix and
+// a new request can skip recomputing it. This is a global, content-keyed
+// cache, unlike the per-sequence baseline/paged layouts.
+//
+// Storage model:
+//   * One physical page per token position (all N_LAYERS × KV_DIM keys +
+//     values): pages are lazy (allocated at first store) and reference-counted
+//     by the tree edges that hold them.
+//   * Tree edges are compressed: an edge is a run of tokens + the pages that
+//     hold their KV. Inserting a diverging sequence splits the shared edge at
+//     the divergence point (tokens and pages divide without copying).
+//   * A page is in the tree while some edge lists it (ref_count == 1).
+//     Active sequences hold *node* references on their matched prefix path,
+//     which pins every page below it; a page referenced only by a tree edge is
+//     evictable.
+//
+// Behavioural notes:
+//   * capacity_tokens() = one page per token (constructor arg, default
+//     MAX_SEQ); tree pages and active sequences share the same pool. When the
+//     pool is full, store() evicts the least-recently-used *leaf* (pages that
+//     no active sequence needs) before throwing std::runtime_error if nothing
+//     is evictable.
+//   * longest_cached_prefix(seq, tokens, n) is the reuse entry point: it
+//     matches the caller's tokens against (1) the sequence's own already
+//     stored content (chat-style growth on one sequence) and (2) the global
+//     tree, splits an edge if the match cuts inside one, protects the matched
+//     path from eviction, and returns the longest length k whose positions
+//     [0, k) hold KV for exactly tokens[0..k). The engine then skips
+//     recomputing positions < k. If the sequence had a previous match, its
+//     protection is released first.
+//   * store() for pos < matched_prefix is a no-op (the shared KV is already
+//     correct; the header contract guarantees content equality there);
+//     positions >= matched prefix are the sequence's own pages and may be
+//     overwritten in place (ppl-style rewind). All layer calls for one
+//     position write into the same page — one page per token, not per layer.
+//   * end_sequence() does NOT drop rows: the sequence's position list is
+//     inserted into the tree (duplicate prefixes are deduplicated — the
+//     second copy's pages are released). Its KV therefore stays cached for
+//     future requests; only pages not referenced by the tree are freed.
+//   * Row pointers stay valid until the pool reuses the page (after an
+//     eviction or clear()); the engine holds rows across one forward pass.
+//   * Thread-safety matches the interface contract: reads under a shared
+//     lock; writes single-threaded under the same lock.
+class RadixKVCache : public KVCache {
+public:
+    explicit RadixKVCache(size_t capacity = MAX_SEQ);
+
+    SeqId begin_sequence() override;
+    void end_sequence(SeqId seq) override;
+    void clear() override;
+
+    void store(SeqId seq, int layer, int pos, int token,
+               const float* k_row, const float* v_row) override;
+    const float* key_row(SeqId seq, int layer, int pos) const override;
+    const float* value_row(SeqId seq, int layer, int pos) const override;
+    int stored_tokens(SeqId seq) const override;
+
+    int longest_cached_prefix(SeqId seq, const int* tokens, int n) const override;
+
+    size_t capacity_tokens() const override;
+    size_t used_tokens() const override;
+    KVCacheStats stats() const override;
+
+private:
+    static constexpr size_t PAGE_BYTES = (size_t)2 * N_LAYERS * KV_DIM * sizeof(float);
+
+    struct KVPage {
+        std::vector<float> keys, values;  // [N_LAYERS][KV_DIM] each
+        size_t ref_count = 0;             // tree edges referencing this page
+    };
+    struct RadixNode {
+        size_t parent_edge = SIZE_MAX;    // incoming edge (SIZE_MAX = root)
+        std::unordered_map<int, size_t> children;  // first token -> edge id
+        size_t ref_count = 0;             // active sequences pinning this path
+        uint64_t last_access = 0;         // LRU clock
+        bool in_lru = false;              // tracked as evictable leaf
+        std::multiset<std::pair<uint64_t, size_t>>::iterator lru_it;
+    };
+    struct RadixEdge {
+        std::vector<int> tokens;          // token run (compressed edge)
+        std::vector<size_t> pages;        // one page per token, 1:1
+        size_t owner = SIZE_MAX;          // node the edge hangs under
+        size_t child = SIZE_MAX;          // node at the end of the run
+    };
+    struct Sequence {
+        std::vector<int> tokens;          // full stored position contents
+        std::vector<size_t> pages;        // physical page per position
+        size_t length = 0;                // positions stored (readable: [0,len))
+        size_t matched_len = 0;           // positions covered by a prefix match
+        size_t tree_node = 0;             // tree path end of last match (refs)
+    };
+
+    // --- tree helpers (caller holds the lock) ---
+    // longest_cached_prefix is const in the public interface but must split
+    // edges and pin/unpin paths (reference Option A: mutable tree metadata);
+    // the helpers below are const and touch only mutable state. The page-pool
+    // helpers (allocate_page/evict_edge) stay non-const — only store() and
+    // end_sequence() use them.
+    size_t alloc_node() const;            // fresh or reused node id
+    void free_node(size_t nid) const;
+    size_t alloc_edge() const;            // fresh or reused edge id
+    void free_edge(size_t eid) const;
+    void add_to_lru(size_t nid) const;    // if evictable leaf (not root, ref 0)
+    void remove_from_lru(size_t nid) const;
+    void touch(size_t nid) const;         // bump last_access (+ re-sort in LRU)
+    size_t split_edge(size_t eid, int k) const;  // split at k; returns new node
+    size_t match_tree(const int* tokens, int n, std::vector<size_t>* pages) const;
+    void insert_tree(const std::vector<int>& tokens,
+                     const std::vector<size_t>& pages, size_t n);
+    void protect_path(size_t nid) const;  // ref-count root..nid (+ touch)
+    void release_path(size_t nid) const;  // undo protect_path
+
+    // --- pages ---
+    size_t allocate_page();               // evicts on demand; may throw
+    void evict_edge(size_t eid);          // free a leaf edge's pages + node
+
+    std::vector<KVPage> pages_;           // grows to capacity, never moves
+    std::vector<size_t> free_pages_;
+    mutable std::vector<RadixNode> nodes_;   // [0] = root, never freed
+    mutable std::vector<size_t> free_nodes_;
+    mutable std::vector<RadixEdge> edges_;
+    mutable std::vector<size_t> free_edges_;
+    mutable std::multiset<std::pair<uint64_t, size_t>> lru_;  // (last_access, node)
+    mutable std::unordered_map<SeqId, Sequence> seqs_;  // matched paths, per Option A
+    SeqId next_ = 0;
+    size_t capacity_;
+    size_t used_pages_ = 0;               // pages held (active or tree)
+    size_t evictions_ = 0;
+    mutable uint64_t clock_ = 0;
+    mutable std::mutex mu_;
     mutable size_t row_fetches_ = 0, prefix_checks_ = 0, prefix_hits_ = 0;
 };
 

@@ -31,6 +31,12 @@ public:
     // Runs one token at position `pos`; returns logits[VOCAB].
     const float* forward(int token, int pos);
 
+    // Consults the cache for tokens[0..n) already stored for this sequence
+    // (chat turns: the re-fed history; fresh trees: 0). Positions below the
+    // returned length are skipped by forward() — their KV rows are read back
+    // from the cache instead of recomputed. Returns the matched length.
+    int use_cached_prefix(const int* tokens, int n);
+
     // Bytes of weights streamed from RAM per generated token
     // (everything except the embedding table, of which only one row is read).
     size_t bytes_per_token() const;
@@ -47,6 +53,7 @@ private:
 
     KVCache* cache_ = nullptr;
     SeqId seq_ = -1;
+    int matched_ = 0;   // positions [0, matched_) hold cached KV (skip recompute)
 };
 
 }  // namespace tl

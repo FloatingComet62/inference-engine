@@ -128,6 +128,7 @@ Stats generate(tl::Model& model, const tl::Tokenizer& tok, tl::Sampler& sampler,
     const double cpu0 = cpu_ms_now();
     auto t0 = Clock::now();
     const float* logits = nullptr;
+    model.use_cached_prefix(prompt.data(), (int)prompt.size());  // skip stored history
     for (int t : prompt) logits = model.forward(t, pos++);
     st.prefill_ms = ms_since(t0);
 
@@ -184,7 +185,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         auto t_load = Clock::now();
-        tl::PagedKVCache kv_cache;  // paged blocks; baseline lives in kv_cache.cpp for A/B
+        tl::RadixKVCache kv_cache;  // radix prefix reuse; paged/baseline in kv_cache.cpp for A/B
         tl::Model model(a.model, kv_cache);
         tl::Tokenizer tok(a.tokenizer);
         const double load_ms = ms_since(t_load);

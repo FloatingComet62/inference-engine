@@ -21,7 +21,7 @@ State: baseline works end-to-end (real weights downloaded in `models/`,
 | --- | --- |
 | `src/config.hpp` | All model sizes as compile-time constants. `TL_TINY_TEST` switches to toy sizes. |
 | `src/kernels.hpp` | `matmul`, `rmsnorm`, `softmax`, `silu`. **Optimise here first.** |
-| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface; `PagedKVCache` (engine default) + `BaselineKVCache` (A/B). Further experiments plug in here. |
+| `src/kv_cache.hpp/.cpp` | KV cache abstraction. `KVCache` interface; `RadixKVCache` (engine default, radix-tree prefix reuse) + `PagedKVCache` + `BaselineKVCache` (backups). |
 | `src/model.cpp` | mmap weight loading, forward pass (uses a `KVCache&`), RoPE cache. |
 | `src/tokenizer.hpp/.cpp` | SentencePiece-style BPE + Zephyr template. |
 | `src/sampler.hpp` | greedy / temperature / top-p. |
@@ -138,27 +138,38 @@ cores via `scripts/physical_cores.sh`), `N`, `RUNS`, `TEMP`, `PROMPT`, `BUILD`.
 ## KV cache experiments (in progress)
 
 `src/kv_cache.hpp` defines the interface (per-token rows, sequence handles,
-content-keyed prefix API, capacity + stats). Two backends live in
+content-keyed prefix API, capacity + stats). Three backends live in
 `src/kv_cache.cpp`:
 
-- **`PagedKVCache`** — engine default. vLLM-style (PagedAttention, SOSP'23):
-  fixed pool of physical blocks (`BLOCK_SIZE=16` tokens, all layers per block),
-  per-sequence logical block tables, lazy allocation, blocks released to the
-  pool on `end_sequence`. `capacity_tokens() = BLOCK_SIZE * pool_blocks`
-  (default `MAX_SEQ` = 2048). Pool exhaustion makes `store()` throw — no
-  eviction yet, and none is safe until the engine can re-prefill gaps.
-  `key_row()`/`value_row()` return `nullptr` for positions ≥ `stored_tokens`.
-- **`BaselineKVCache`** — flat per-sequence `[N_LAYERS][MAX_SEQ][KV_DIM]`
-  arrays, kept for A/B; swap back at the single construction site in
-  `src/main.cpp`.
+- **`RadixKVCache`** — engine default. RadixAttention (SGLang,
+  arXiv:2312.07104): a global compressed radix tree of token prefixes
+  (compressed edges, split at divergence points) backed by one-token physical
+  KV pages shared between all sequences that match a prefix. Matches are
+  content-verified, protect shared pages from eviction via path refcounts,
+  deduplicate identical prefixes on insert, and evict the least-recently-used
+  *leaf* when the shared pool (default `MAX_SEQ` = 2048 pages, 360 KB each on
+  the real model) is exhausted. `store()` on a matched position is a no-op;
+  positions beyond a match are the sequence's own pages (rewritable).
+- **`PagedKVCache`** — PagedAttention (SOSP'23): fixed block pool + per-seq
+  block tables; `store()` throws on pool exhaustion (no eviction).
+- **`BaselineKVCache`** — flat per-sequence arrays, kept for A/B; swap back
+  at the single construction site in `src/main.cpp`.
 
-Remaining experiments: `FreeOnFinish` (drop rows at end), `PrefixCaching`
-(content-keyed re-use, skip prefill), `BoundedGrowth` (eviction under a cap).
-Note: real cross-request prefix caching needs the engine to consult
-`longest_cached_prefix` in `generate()` before prefilling — not wired yet.
-Memory benefit of paging: peak allocation tracks stored tokens (a full real
-context caps at `MAX_SEQ/BLOCK_SIZE = 128` blocks × 5.8 MB ≈ 738 MB, same
-ceiling as baseline but only reached when actually used).
+Engine wiring: `Model::use_cached_prefix()` calls `longest_cached_prefix`
+before prefilling; `Model::forward` skips the K/V matmuls + `store()` for
+positions inside the matched prefix and reads those rows back from the cache
+(attention math unchanged, so output is byte-identical — verified). The cache
+instance is shared across `Model`s, so a second request whose prompt repeats a
+completed sequence's prefix skips recomputing it entirely (no duplicated KV
+pages: verified, e.g. `used_tokens` 29 = 17 shared + 12 new for a repeated
+5-token prompt + 12 decoded tokens).
+
+Remaining experiments: `FreeOnFinish` (drop rows at end), `BoundedGrowth`
+(eviction under a cap). `ppl` deliberately does not consult the prefix API
+(fully independent-chunk scoring, byte-identical). One caveat: the CLI is
+single-request (run/chat/ppl), so cross-request reuse shows in a runtime that
+keeps one cache across requests — the interface tests + a two-`Model` harness
+cover it.
 
 ## Planned next steps (from PLAN.md, in priority order)
 

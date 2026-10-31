@@ -94,6 +94,11 @@ Model::~Model() {
     if (map_) munmap(map_, file_size_);
 }
 
+int Model::use_cached_prefix(const int* tokens, int n) {
+    matched_ = cache_->longest_cached_prefix(seq_, tokens, n);
+    return matched_;
+}
+
 size_t Model::bytes_per_token() const {
     return file_size_ - HEADER_BYTES - (size_t)VOCAB * DIM * sizeof(float) + DIM * sizeof(float);
 }
@@ -117,11 +122,13 @@ const float* Model::forward(int token, int pos) {
         // ---- attention ----
         rmsnorm(xb, x, L.attn_norm, DIM);
         matmul(q, xb, L.wq, DIM, DIM);
-        matmul(k_tmp_.data(), xb, L.wk, DIM, KV_DIM);
-        matmul(v_tmp_.data(), xb, L.wv, DIM, KV_DIM);
         for (int h = 0; h < N_HEADS; h++)    rope(q + h * HEAD_DIM, cs, sn);
-        for (int h = 0; h < N_KV_HEADS; h++) rope(k_tmp_.data() + h * HEAD_DIM, cs, sn);
-        cache_->store(seq_, l, pos, token, k_tmp_.data(), v_tmp_.data());
+        if (pos >= matched_) {   // cached prefix: rows read back below, not recomputed
+            matmul(k_tmp_.data(), xb, L.wk, DIM, KV_DIM);
+            matmul(v_tmp_.data(), xb, L.wv, DIM, KV_DIM);
+            for (int h = 0; h < N_KV_HEADS; h++) rope(k_tmp_.data() + h * HEAD_DIM, cs, sn);
+            cache_->store(seq_, l, pos, token, k_tmp_.data(), v_tmp_.data());
+        }
 
         // Per-position row pointers (single-threaded; the parallel loop only reads).
         for (int t = 0; t <= pos; t++) {

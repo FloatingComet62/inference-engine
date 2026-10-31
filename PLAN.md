@@ -3,10 +3,10 @@
 ```
 src/config.hpp      TinyLlama sizes as compile-time constants
 src/kernels.hpp     matmul, rmsnorm, softmax, silu  <- optimise here first
-src/kv_cache.hpp    KV cache interface (PagedKVCache default, vLLM-style;
+src/kv_cache.hpp    KV cache interface (RadixKVCache default, radix-tree
 
-                    baseline + free-on-finish, prefix caching, bounded
-                    growth are the remaining experiments)
+                    prefix reuse + LRU eviction; paged vLLM-style + baseline
+                    kept for A/B; free-on-finish, bounded growth remaining)
 src/model.cpp       weight loading (mmap) and the forward pass
 src/tokenizer.cpp   SentencePiece-style BPE + chat template
 src/sampler.hpp     greedy, temperature, top-p

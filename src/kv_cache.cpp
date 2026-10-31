@@ -221,4 +221,392 @@ KVCacheStats PagedKVCache::stats() const {
             row_fetches_, prefix_checks_, prefix_hits_, 0};
 }
 
+// ---------------------------------------------------------------------------
+// RadixKVCache — RadixAttention (SGLang, arXiv:2312.07104): a global radix
+// tree of token prefixes backed by shared one-token KV pages. See kv_cache.hpp
+// for the full behavioural contract. All methods take mu_; helpers assume the
+// caller holds it.
+// ---------------------------------------------------------------------------
+
+RadixKVCache::RadixKVCache(size_t capacity) : capacity_(capacity ? capacity : 1) {
+    nodes_.push_back(RadixNode{});   // node 0 = root
+}
+
+SeqId RadixKVCache::begin_sequence() {
+    std::lock_guard<std::mutex> lk(mu_);
+    SeqId id = next_++;
+    seqs_[id] = Sequence{};
+    return id;
+}
+
+void RadixKVCache::end_sequence(SeqId seq) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = seqs_.find(seq);
+    if (it == seqs_.end()) return;   // unknown seq: nothing to do (baseline parity)
+    Sequence s = std::move(it->second);
+    seqs_.erase(it);
+
+    // Insert the completed sequence into the tree; every position the tree
+    // already covers (matched prefix or an identical stored prefix) keeps its
+    // existing edge/pages — the incoming copy is dropped, never duplicated.
+    insert_tree(s.tokens, s.pages, s.length);
+    // Pages the tree did not adopt are this sequence's unshared copies -> free.
+    for (size_t p : s.pages)
+        if (pages_[p].ref_count == 0) { free_pages_.push_back(p); used_pages_--; }
+    // Un-pin the matched tree path (the tree itself still owns its pages).
+    if (s.tree_node != SIZE_MAX) release_path(s.tree_node);
+}
+
+void RadixKVCache::clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    seqs_.clear();
+    // Rebuild the node/edge arenas: every id ever created becomes free.
+    free_nodes_.clear();
+    for (size_t i = 1; i < nodes_.size(); i++) { nodes_[i] = RadixNode{}; free_nodes_.push_back(i); }
+    nodes_[0] = RadixNode{};   // root stays, emptied
+    free_edges_.clear();
+    for (size_t i = 0; i < edges_.size(); i++) free_edges_.push_back(i);
+    lru_.clear();
+    // Pages: all rows become reusable (payload memory is kept for the pool).
+    free_pages_.clear();
+    for (size_t p = 0; p < pages_.size(); p++) { pages_[p].ref_count = 0; free_pages_.push_back(p); }
+    used_pages_ = 0;
+}
+
+void RadixKVCache::store(SeqId seq, int layer, int pos, int token,
+                         const float* k_row, const float* v_row) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Sequence& s = seqs_.at(seq);   // throws for unknown seq
+    if (layer < 0 || layer >= N_LAYERS)
+        throw std::logic_error("radix kv cache: layer out of range");
+    if (pos < (int)s.matched_len) return;   // shared prefix: KV already there
+    if (pos > (int)s.length)
+        throw std::logic_error("radix kv cache: store out of order");
+
+    float* kdst;
+    float* vdst;
+    if (pos == (int)s.length) {              // append: new own page
+        const size_t p = allocate_page();
+        s.tokens.push_back(token);
+        s.pages.push_back(p);
+        s.length++;
+        kdst = pages_[p].keys.data() + (size_t)layer * KV_DIM;
+        vdst = pages_[p].values.data() + (size_t)layer * KV_DIM;
+    } else {                                 // overwrite own position (ppl rewind)
+        const size_t p = s.pages[pos];
+        s.tokens[pos] = token;
+        kdst = pages_[p].keys.data() + (size_t)layer * KV_DIM;
+        vdst = pages_[p].values.data() + (size_t)layer * KV_DIM;
+    }
+    std::memcpy(kdst, k_row, KV_DIM * sizeof(float));
+    std::memcpy(vdst, v_row, KV_DIM * sizeof(float));
+}
+
+const float* RadixKVCache::key_row(SeqId seq, int layer, int pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++row_fetches_;
+    const Sequence& s = seqs_.at(seq);   // throws for unknown seq
+    if (layer < 0 || layer >= N_LAYERS || pos < 0 || (size_t)pos >= s.length)
+        return nullptr;
+    return pages_[s.pages[pos]].keys.data() + (size_t)layer * KV_DIM;
+}
+
+const float* RadixKVCache::value_row(SeqId seq, int layer, int pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++row_fetches_;
+    const Sequence& s = seqs_.at(seq);
+    if (layer < 0 || layer >= N_LAYERS || pos < 0 || (size_t)pos >= s.length)
+        return nullptr;
+    return pages_[s.pages[pos]].values.data() + (size_t)layer * KV_DIM;
+}
+
+int RadixKVCache::stored_tokens(SeqId seq) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return (int)seqs_.at(seq).length;
+}
+
+int RadixKVCache::longest_cached_prefix(SeqId seq, const int* tokens, int n) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++prefix_checks_;
+    Sequence& s = seqs_.at(seq);   // mutable by design (records the match)
+
+    // (1) The sequence's own already-stored content (chat-style growth: the
+    //     engine keeps one sequence across turns and re-feeds the history).
+    int k1 = 0;
+    while (k1 < n && k1 < (int)s.tokens.size() && s.tokens[k1] == tokens[k1]) k1++;
+
+    // (2) The global tree (fresh-request reuse). Matching inside a compressed
+    //     edge splits it at the divergence point so the shared pages stay
+    //     protected under a clean root..node path.
+    std::vector<size_t> tpages;
+    const size_t tnode = match_tree(tokens, n, &tpages);
+    const int m2 = (int)tpages.size();
+
+    if (s.tree_node != SIZE_MAX) { release_path(s.tree_node); s.tree_node = SIZE_MAX; }
+    if (m2 > 0) { protect_path(tnode); s.tree_node = tnode; }
+
+    // Tree positions beyond the sequence's own match become visible reads for
+    // this sequence (pages/tokens reconciled); a stale own copy is discarded
+    // on end_sequence.
+    if (m2 > k1) {
+        if ((int)s.tokens.size() < m2) { s.tokens.resize(m2); s.pages.resize(m2); }
+        for (int i = k1; i < m2; i++) { s.tokens[i] = tokens[i]; s.pages[i] = tpages[i]; }
+        if (s.length < (size_t)m2) s.length = m2;
+    }
+
+    const int matched = m2 > k1 ? m2 : k1;
+    s.matched_len = matched;
+    if (matched > 0) ++prefix_hits_;
+    return matched;
+}
+
+size_t RadixKVCache::capacity_tokens() const {
+    return capacity_;
+}
+
+size_t RadixKVCache::used_tokens() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return used_pages_;
+}
+
+KVCacheStats RadixKVCache::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return {seqs_.size(), used_pages_, used_pages_ * PAGE_BYTES,
+            row_fetches_, prefix_checks_, prefix_hits_, evictions_};
+}
+
+// ---- tree helpers ----
+
+size_t RadixKVCache::alloc_node() const {
+    size_t id;
+    if (!free_nodes_.empty()) { id = free_nodes_.back(); free_nodes_.pop_back(); nodes_[id] = RadixNode{}; }
+    else { id = nodes_.size(); nodes_.push_back(RadixNode{}); }
+    return id;
+}
+
+void RadixKVCache::free_node(size_t nid) const {
+    RadixNode& n = nodes_[nid];
+    if (n.in_lru) { lru_.erase(n.lru_it); n.in_lru = false; }
+    n.children.clear();   // evicted nodes are leaves anyway
+    free_nodes_.push_back(nid);
+}
+
+size_t RadixKVCache::alloc_edge() const {
+    size_t id;
+    if (!free_edges_.empty()) { id = free_edges_.back(); free_edges_.pop_back(); edges_[id] = RadixEdge{}; }
+    else { id = edges_.size(); edges_.push_back(RadixEdge{}); }
+    return id;
+}
+
+void RadixKVCache::free_edge(size_t eid) const {
+    edges_[eid].tokens.clear();
+    edges_[eid].pages.clear();
+    free_edges_.push_back(eid);
+}
+
+void RadixKVCache::add_to_lru(size_t nid) const {
+    RadixNode& n = nodes_[nid];
+    if (nid == 0 || n.in_lru || n.ref_count != 0 || !n.children.empty()) return;
+    n.in_lru = true;
+    n.lru_it = lru_.insert({n.last_access, nid});
+}
+
+void RadixKVCache::remove_from_lru(size_t nid) const {
+    RadixNode& n = nodes_[nid];
+    if (!n.in_lru) return;
+    lru_.erase(n.lru_it);
+    n.in_lru = false;
+}
+
+void RadixKVCache::touch(size_t nid) const {
+    RadixNode& n = nodes_[nid];
+    n.last_access = ++clock_;
+    if (n.in_lru) {                    // still a leaf: keep tracked at the new time
+        lru_.erase(n.lru_it);
+        n.lru_it = lru_.insert({n.last_access, nid});
+    }
+}
+
+// Split edge `eid` at token index k (1 <= k < size): the first k tokens keep
+// the edge id and owner; the remainder moves to a fresh edge under a new
+// intermediate node, preserving the old child. Physical pages are moved, never
+// copied. Returns the new node id.
+size_t RadixKVCache::split_edge(size_t eid, int k) const {
+    // Allocate before grabbing references: alloc_node/alloc_edge push to
+    // vectors that may reallocate and invalidate held RadixEdge/RadixNode
+    // references.
+    const size_t nx = alloc_node();
+    const size_t e2 = alloc_edge();
+    RadixEdge& ed = edges_[eid];       // fetched after all growth
+    RadixEdge& rem = edges_[e2];
+    RadixNode& NX = nodes_[nx];
+    const size_t old_child = ed.child;
+    NX.parent_edge = eid;
+
+    rem.tokens.assign(ed.tokens.begin() + k, ed.tokens.end());
+    rem.pages.assign(ed.pages.begin() + k, ed.pages.end());
+    rem.owner = nx;
+    rem.child = old_child;
+    NX.children[rem.tokens[0]] = e2;
+    nodes_[old_child].parent_edge = e2;
+
+    ed.tokens.resize(k);
+    ed.pages.resize(k);
+    ed.child = nx;
+    return nx;
+}
+
+// Walk the tree matching tokens[0..n); split edges that match only partially
+// (the prefix the caller keeps runs to the new node). Returns the node at the
+// end of the matched path; if `pages` is non-null, appends the physical page
+// of every matched token in order.
+size_t RadixKVCache::match_tree(const int* tokens, int n, std::vector<size_t>* pages) const {
+    size_t node = 0;
+    int i = 0;
+    while (i < n) {
+        auto it = nodes_[node].children.find(tokens[i]);
+        if (it == nodes_[node].children.end()) break;
+        const size_t eid = it->second;
+        const RadixEdge& ed = edges_[eid];
+        int common = 0;
+        while (common < (int)ed.tokens.size() && i + common < n &&
+               ed.tokens[common] == tokens[i + common]) common++;
+        if (pages)
+            for (int c = 0; c < common; c++) pages->push_back(ed.pages[c]);
+        i += common;
+        if (common < (int)ed.tokens.size()) {      // match cuts inside the edge
+            remove_from_lru(ed.owner);             // owner gains a child -> not a leaf
+            node = split_edge(eid, common);
+            break;
+        }
+        node = ed.child;
+    }
+    return node;
+}
+
+// Insert a completed sequence into the tree: walk existing edges while the
+// tokens agree, split on divergence, and attach the remaining tokens/pages as
+// a fresh edge (adopting their pages). Positions already covered by a matching
+// edge are left alone — their incoming pages (matched by reference or a
+// duplicate copy) are not adopted; the caller frees the unadopted copies.
+void RadixKVCache::insert_tree(const std::vector<int>& tokens,
+                               const std::vector<size_t>& pages, size_t n) {
+    size_t node = 0;
+    size_t i = 0;
+    while (i < n) {
+        auto it = nodes_[node].children.find(tokens[i]);
+        if (it == nodes_[node].children.end()) {
+            const size_t eid = alloc_edge();
+            RadixEdge& ed = edges_[eid];
+            ed.tokens.assign(tokens.begin() + i, tokens.begin() + n);
+            ed.pages.assign(pages.begin() + i, pages.begin() + n);
+            ed.owner = node;
+            ed.child = alloc_node();
+            nodes_[ed.child].parent_edge = eid;
+            for (size_t c = 0; c < ed.pages.size(); c++) pages_[ed.pages[c]].ref_count++;
+            touch(ed.child);
+            add_to_lru(ed.child);
+            nodes_[node].children[ed.tokens[0]] = eid;
+            remove_from_lru(node);   // gained a child -> no longer a leaf
+            return;
+        }
+        const size_t eid = it->second;
+        const RadixEdge& ed = edges_[eid];
+        int common = 0;
+        while (common < (int)ed.tokens.size() && i + common < n &&
+               ed.tokens[common] == tokens[i + common]) common++;
+        if (common < (int)ed.tokens.size()) {      // diverge inside the edge
+            size_t nx = split_edge(eid, common);
+            if (i + (size_t)common < n) {          // attach the remaining tokens
+                const size_t e2 = alloc_edge();
+                RadixEdge& ne = edges_[e2];
+                ne.tokens.assign(tokens.begin() + i + common, tokens.begin() + n);
+                ne.pages.assign(pages.begin() + i + common, pages.begin() + n);
+                ne.owner = nx;
+                ne.child = alloc_node();
+                nodes_[ne.child].parent_edge = e2;
+                for (size_t c = 0; c < ne.pages.size(); c++) pages_[ne.pages[c]].ref_count++;
+                touch(ne.child);
+                add_to_lru(ne.child);
+                nodes_[nx].children[ne.tokens[0]] = e2;
+            }
+            return;
+        }
+        node = ed.child;                           // full edge consumed; no adoption
+        i += (size_t)common;
+    }
+}
+
+void RadixKVCache::protect_path(size_t nid) const {
+    size_t cur = nid;
+    while (true) {
+        touch(cur);
+        nodes_[cur].ref_count++;
+        remove_from_lru(cur);
+        if (cur == 0) break;
+        cur = edges_[nodes_[cur].parent_edge].owner;
+    }
+}
+
+void RadixKVCache::release_path(size_t nid) const {
+    size_t cur = nid;
+    while (true) {
+        if (--nodes_[cur].ref_count == 0) add_to_lru(cur);
+        if (cur == 0) break;
+        cur = edges_[nodes_[cur].parent_edge].owner;
+    }
+}
+
+// ---- page pool ----
+
+size_t RadixKVCache::allocate_page() {
+    if (!free_pages_.empty()) {
+        const size_t p = free_pages_.back(); free_pages_.pop_back();
+        used_pages_++;
+        return p;
+    }
+    if (pages_.size() < capacity_) {
+        pages_.emplace_back();
+        pages_.back().keys.resize((size_t)N_LAYERS * KV_DIM);
+        pages_.back().values.resize((size_t)N_LAYERS * KV_DIM);
+        used_pages_++;
+        return pages_.size() - 1;
+    }
+    // At capacity: evict least-recently-used leaves until a page frees up.
+    while (free_pages_.empty() && !lru_.empty()) {
+        const auto it = lru_.begin();
+        const uint64_t acc = it->first;
+        const size_t nid = it->second;
+        lru_.erase(it);
+        RadixNode& n = nodes_[nid];
+        if (n.in_lru && n.last_access == acc && n.ref_count == 0 &&
+            n.children.empty() && n.parent_edge != SIZE_MAX) {
+            n.in_lru = false;
+            evict_edge(n.parent_edge);   // frees >= 1 page (updates evictions_)
+        } else {
+            n.in_lru = false;            // stale entry: drop
+        }
+    }
+    if (!free_pages_.empty()) {
+        const size_t p = free_pages_.back(); free_pages_.pop_back();
+        used_pages_++;
+        return p;
+    }
+    throw std::runtime_error("radix kv cache: capacity exhausted, no evictable leaf");
+}
+
+void RadixKVCache::evict_edge(size_t eid) {
+    RadixEdge& ed = edges_[eid];
+    const size_t parent = ed.owner;
+    const size_t child = ed.child;
+    free_node(child);
+    for (size_t p : ed.pages) {
+        if (--pages_[p].ref_count == 0) { free_pages_.push_back(p); used_pages_--; }
+        evictions_++;
+    }
+    nodes_[parent].children.erase(ed.tokens[0]);
+    free_edge(eid);
+    add_to_lru(parent);   // parent may have become an evictable leaf
+}
+
 }  // namespace tl
