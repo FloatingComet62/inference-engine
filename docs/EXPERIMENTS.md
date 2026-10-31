@@ -14,7 +14,7 @@ Add a row whenever you try something; keep the losers, they are results too.
 | Summaries / quoting text (2x decode) | add `--spec ngram` to ENGINE_FLAGS (greedy only: `TEMP=0`) |
 | Compare against Ollama | `make compare N=64 RUNS=5 WTYPE=q4a ENGINE_FLAGS="--kv q8"` |
 | Quality vs fp32 (WikiText-2) | `make eval WTYPE=q4a` |
-| Chat UI with both engines | `make serve WTYPE=q4a ENGINE_FLAGS="--kv q8"` + `make ollama-serve` + `make webui` (via uv, first run downloads ~1 GB) -> http://localhost:3000 |
+| Chat UI with both engines (+ dashboard) | `make up` -> http://localhost:3000 and http://localhost:8000/dashboard; `make down` stops all three |
 | Sanity check after any change | `make smoke` |
 | Benchmark dashboard (all runs, charts, this log) | `make serve`, then http://localhost:8000/dashboard |
 | Both models side by side in Open WebUI | click **+** next to the model name, add `tinyllama-cpp` and `tinyllama:1.1b`; the (i) under each reply shows tok/s |

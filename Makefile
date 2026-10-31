@@ -33,7 +33,7 @@ BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --thread
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui up down
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -46,6 +46,7 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make up            start Ollama + this engine's API + Open WebUI (make down stops them)"
 	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
 	@echo "  make webui         Open WebUI (via uv) on :3000, connected to Ollama + this engine"
 	@echo "  make eval          WikiText-2 perplexity + KL divergence vs fp32"
@@ -154,6 +155,29 @@ webui:
 	    OLLAMA_BASE_URL=http://127.0.0.1:11434 \
 	    OPENAI_API_BASE_URL=http://127.0.0.1:$(API_PORT)/v1 OPENAI_API_KEY=none \
 	    uvx --python 3.11 open-webui@latest serve --host 127.0.0.1 --port $(WEBUI_PORT)
+
+# One command for the whole chat setup: starts Ollama (CPU-only), this engine's API and
+# Open WebUI in the background, skipping any that already answer. Logs go to runs/logs/.
+UP_FLAGS ?= --kv q8
+up: build
+	@mkdir -p runs/logs
+	@curl -s -m 2 -o /dev/null localhost:11434/api/tags || { \
+	    OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" nohup ollama serve > runs/logs/ollama.log 2>&1 & \
+	    echo "started Ollama"; }
+	@curl -s -m 2 -o /dev/null localhost:$(API_PORT)/v1/models || { \
+	    nohup $(MAKE) --no-print-directory serve WTYPE=q4a ENGINE_FLAGS="$(UP_FLAGS)" > runs/logs/api.log 2>&1 & \
+	    echo "started tinyllama API (q4a $(UP_FLAGS))"; }
+	@curl -s -m 2 -o /dev/null localhost:$(WEBUI_PORT) || { \
+	    nohup $(MAKE) --no-print-directory webui > runs/logs/webui.log 2>&1 & \
+	    echo "started Open WebUI (first start takes ~1 min)"; }
+	@echo "chat:      http://localhost:$(WEBUI_PORT)"
+	@echo "dashboard: http://localhost:$(API_PORT)/dashboard"
+
+down:
+	@# patterns are anchored so they cannot match this recipe's own shell command
+	-@pkill -f "^(uv tool uvx|/[^ ]*python[^ ]*) .*open-webui" && echo "stopped Open WebUI" || true
+	-@pkill -f "^[^ ]*python[^ ]* tools/openai_server.py" && echo "stopped tinyllama API" || true
+	-@pkill -x ollama && echo "stopped Ollama" || true
 
 ollama-serve:
 	sudo pkill ollama && OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" ollama serve
