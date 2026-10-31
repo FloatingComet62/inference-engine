@@ -134,8 +134,21 @@ size_t Model::bytes_per_token() const {
 // prefill register tile: 2 rows x 4 tokens measured best (2x4, 3x4, 4x4 within noise; 4x2 slower)
 static constexpr int TR = 2, TC = 4;
 
+// Calibration (quantize --wtype q4a): accumulate per-input-channel sum of x^2 for
+// matrix m, plus the token count in the last slot.
+void Model::record_calib(const float* x, const Mat& m, int n_in, int T) {
+    if (!calib_) return;
+    auto& acc = (*calib_)[m.w];
+    acc.resize(n_in + 1);
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < n_in; i++) acc[i] += (double)x[(size_t)t * n_in + i] * x[(size_t)t * n_in + i];
+    acc[n_in] += T;
+}
+
 // Quantise T activation rows of length n_in into xq_/xd_/xs_ (no-op for fp32 weights).
+// Every matmul input passes through here, so it also feeds calibration.
 void Model::quant_act(const float* x, const Mat& m, int n_in, int T) {
+    record_calib(x, m, n_in, T);
     if (m.t == WType::F32) return;
     const int nb = n_in / QK;
     auto quant = [&](int b, int e) {
@@ -225,7 +238,8 @@ const float* Model::prefill(const int* tokens, int n, int pos) {
     return logits;
 }
 
-void Model::save_quantized(const std::string& path, WType mats, WType head) const {
+void Model::save_quantized(const std::string& path, WType mats, WType head,
+                           const std::map<const void*, std::vector<double>>* act_ms) const {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
     char hdr[HEADER_BYTES] = {};
@@ -247,11 +261,18 @@ void Model::save_quantized(const std::string& path, WType mats, WType head) cons
         if (m.t != WType::F32) throw std::runtime_error("quantize needs an fp32 source model");
         const float* w = static_cast<const float*>(m.w);
         std::vector<char> buf(row_bytes(t, n_in) * n_out);
+        std::vector<float> imp;   // mean x^2 per input channel, if calibrated
+        if (act_ms && t == WType::Q4) {
+            auto it = act_ms->find(m.w);
+            if (it == act_ms->end()) throw std::runtime_error("matrix missing from calibration");
+            for (int i = 0; i < n_in; i++) imp.push_back((float)(it->second[i] / it->second[n_in]));
+        }
 #pragma omp parallel for schedule(static)
         for (int r = 0; r < n_out; r++) {
             char* dst = buf.data() + row_bytes(t, n_in) * r;
             const float* src = w + (size_t)r * n_in;
-            if (t == WType::Q4) quantize_row_q4(src, reinterpret_cast<BlockQ4*>(dst), n_in);
+            if (t == WType::Q4 && !imp.empty()) quantize_row_q4_weighted(src, reinterpret_cast<BlockQ4*>(dst), n_in, imp.data());
+            else if (t == WType::Q4) quantize_row_q4(src, reinterpret_cast<BlockQ4*>(dst), n_in);
             else if (t == WType::Q8) quantize_row_q8(src, reinterpret_cast<BlockQ8*>(dst), n_in);
             else std::memcpy(dst, src, n_in * sizeof(float));
         }
@@ -311,6 +332,8 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
         // Q, K and V in one dispatch over their concatenated rows, sharing one activation
         // quantisation (all three take xb). Each row's dot product is unchanged.
         quant_act(xb, L.wq, DIM, T);
+        record_calib(xb, L.wk, DIM, T);   // fused: wk/wv share wq's input
+        record_calib(xb, L.wv, DIM, T);
         parallel_for(DIM + 2 * KV_DIM, [&](int b, int e) {
             auto seg = [&](float* out, int ld, const Mat& m, int lo) {   // rows [lo, lo+ld) of the concat
                 const int sb = b > lo ? b - lo : 0, se = e - lo < ld ? e - lo : ld;
@@ -377,6 +400,7 @@ const float* Model::forward_batch(const int* tokens, int T, int pos0) {
         // gate and up in one dispatch: each worker computes matching gate/up rows and
         // applies SwiGLU in the epilogue (no separate silu pass, one barrier fewer).
         quant_act(xb, L.w_gate, DIM, T);
+        record_calib(xb, L.w_up, DIM, T);   // fused: w_up shares w_gate's input
         parallel_for(HIDDEN, [&](int b, int e) {
             mm_rows(hb, HIDDEN, xb, L.w_gate, DIM, b, e, T);
             mm_rows(hb2, HIDDEN, xb, L.w_up, DIM, b, e, T);

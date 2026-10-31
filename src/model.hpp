@@ -3,6 +3,7 @@
 #include "kernels_q4.hpp"
 #include "kv_cache.hpp"
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,12 @@ public:
     size_t bytes_per_token() const;
 
     // Writes this (fp32) model as a version-2 file: matrices as `mats`, output head as `head`.
-    void save_quantized(const std::string& path, WType mats, WType head) const;
+    // With `act_ms` (from calibrate()), Q4 matrices use the activation-weighted scale search.
+    void save_quantized(const std::string& path, WType mats, WType head,
+                        const std::map<const void*, std::vector<double>>* act_ms = nullptr) const;
+    // Calibration: while set, quant_act() accumulates per-input-channel sum of x^2 (and the token
+    // count in the extra last element) for each matrix it multiplies, keyed by weight pointer.
+    void set_calibration(std::map<const void*, std::vector<double>>* acc) { calib_ = acc; }
 
 private:
     void* map_ = nullptr;
@@ -62,6 +68,7 @@ private:
     // out[T][n_out] = x[T][n_in] . W^T
     void mm(float* out, const float* x, const Mat& m, int n_in, int n_out, int T);
     void quant_act(const float* x, const Mat& m, int n_in, int T);
+    void record_calib(const float* x, const Mat& m, int n_in, int T);
     void mm_rows(float* out, int ldo, const float* x, const Mat& m, int n_in, int b, int e, int T);
     void mm_residual(float* x, const float* in, const Mat& m, int n_in, int T);
     std::vector<int8_t> xq_;   // quantised activations for mm()
@@ -84,6 +91,7 @@ private:
     std::vector<float> rope_cos_, rope_sin_;       // [MAX_SEQ][HEAD_DIM/2]
 
     KVCache* cache_ = nullptr;
+    std::map<const void*, std::vector<double>>* calib_ = nullptr;
     SeqId seq_ = -1;
 };
 

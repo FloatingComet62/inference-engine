@@ -83,7 +83,8 @@ struct Args {
         "  --max-tokens N      ppl: max tokens scored (default 2048)\n"
         "  --ref-model PATH    ppl: reference model for KL divergence / top-1 agreement\n"
         "  --out PATH          quantize: output file\n"
-        "  --wtype q4|q8       quantize: matrix format (output head is always q8)\n"
+        "  --wtype q4|q8|q4a   quantize: matrix format (output head is always q8); q4a = Q4 with\n"
+        "                      activation-weighted scales, calibrated on --text (first --max-tokens)\n"
         "  --pool spin|omp     thread runtime (default spin)\n"
         "  --prefill batch|seq prompt processing (default batch)\n"
         "  --kv f32|q8         attention KV working copy precision (default f32)\n"
@@ -217,10 +218,25 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (a.mode == "quantize") {
-            if (a.out.empty() || (a.wtype != "q4" && a.wtype != "q8")) usage(1);
-            tl::BaselineKVCache unused;   // the forward pass is not run
-            tl::Model src(a.model, unused);
-            src.save_quantized(a.out, a.wtype == "q4" ? tl::WType::Q4 : tl::WType::Q8, tl::WType::Q8);
+            if (a.out.empty() || (a.wtype != "q4" && a.wtype != "q8" && a.wtype != "q4a")) usage(1);
+            tl::BaselineKVCache cache;   // only used by q4a calibration
+            tl::Model src(a.model, cache);
+            std::map<const void*, std::vector<double>> act;
+            if (a.wtype == "q4a") {
+                // calibration: run the fp32 model over --text, record per-channel activation x^2
+                std::ifstream in(a.text.empty() ? "bench/data/eval.txt" : a.text);
+                std::stringstream ss; ss << in.rdbuf();
+                tl::Tokenizer tok(a.tokenizer);
+                auto ids = tok.encode(ss.str(), true);
+                ids.insert(ids.begin(), tl::BOS);
+                const int n = std::min<int>((int)ids.size(), std::min(a.max_tokens, tl::MAX_SEQ));
+                src.set_calibration(&act);
+                src.prefill(ids.data(), n, 0);
+                src.set_calibration(nullptr);
+                std::fprintf(stderr, "calibrated on %d tokens\n", n);
+            }
+            src.save_quantized(a.out, a.wtype == "q8" ? tl::WType::Q8 : tl::WType::Q4, tl::WType::Q8,
+                               a.wtype == "q4a" ? &act : nullptr);
             std::fprintf(stderr, "wrote %s\n", a.out.c_str());
             return 0;
         }

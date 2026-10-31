@@ -54,6 +54,35 @@ inline void quantize_row_q4(const float* x, BlockQ4* out, int n) {
     }
 }
 
+// Activation-aware Q4: same block format, but each block's scale is chosen from
+// d = s * amax / 7, s in {0.80, 0.82, ..., 1.10}, minimising sum_i imp[i] * (w_i - d*q_i)^2,
+// where imp[i] = mean squared activation of input channel i (from calibration).
+// The error is measured with the fp16-rounded scale actually stored.
+inline void quantize_row_q4_weighted(const float* x, BlockQ4* out, int n, const float* imp) {
+    for (int b = 0; b < n / QK; b++, x += QK, imp += QK) {
+        float amax = 0.0f;
+        for (int i = 0; i < QK; i++) amax = std::fmax(amax, std::fabs(x[i]));
+        float best_d = 0.0f, best_err = INFINITY;
+        for (int k = 0; k <= 15; k++) {
+            const float d = (float)(_Float16)((0.80f + 0.02f * k) * amax / 7.0f), id = d ? 1.0f / d : 0.0f;
+            float err = 0.0f;
+            for (int i = 0; i < QK; i++) {
+                int r = (int)std::lround(x[i] * id);
+                r = r < -8 ? -8 : r > 7 ? 7 : r;
+                const float e = x[i] - d * r;
+                err += imp[i] * e * e;
+            }
+            if (err < best_err) { best_err = err; best_d = d; }
+        }
+        const float id = best_d ? 1.0f / best_d : 0.0f;
+        out[b].d = (_Float16)best_d;
+        for (int i = 0; i < QK / 2; i++) {
+            auto q = [&](float v) { int r = (int)std::lround(v * id); return (uint8_t)((r < -8 ? -8 : r > 7 ? 7 : r) + 8); };
+            out[b].qs[i] = q(x[i]) | (uint8_t)(q(x[i + QK / 2]) << 4);
+        }
+    }
+}
+
 inline void quantize_row_q8(const float* x, BlockQ8* out, int n) {
     for (int b = 0; b < n / QK; b++, x += QK) {
         float amax = 0.0f;
