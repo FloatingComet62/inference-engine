@@ -23,7 +23,11 @@ WTYPE       ?= q4
 F32_WEIGHTS := $(MODELS)/tinyllama-f32.bin
 WEIGHTS     := $(MODELS)/tinyllama-$(WTYPE).bin
 TOKENIZER   := $(MODELS)/tokenizer.bin
-ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) $(ENGINE_FLAGS)
+#CACHE       := baseline
+#CACHE       := paged
+#CACHE       := radix
+CACHE       := streaming
+ENGINE_ARGS := --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) --cache $(CACHE)
 BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --threads $(THREADS) \
                -n $(N) --runs $(RUNS) --ollama-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) \
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)

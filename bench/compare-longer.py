@@ -38,47 +38,907 @@ def tagged_system():
     _run_counter += 1
     return f"[session {RUN_ID}-{_run_counter}] {SYSTEM}"
 PROMPTS = [
-    """You are the lead systems engineer designing a CPU-only inference engine for decoder-only transformer models. Write a detailed engineering design review. The engine must load model weights, tokenize input, execute transformer layers, maintain KV state for multiple independent sequences, and stream generated tokens.
+    """You are the principal systems architect responsible for designing a production-grade CPU-only inference engine for decoder-only transformer models. You are preparing an exhaustive technical architecture specification that will be used by multiple engineering teams to implement the system independently.
 
-    Cover: (1) architecture and responsibilities of the tokenizer, model loader, tensor layer, CPU operators, transformer block, sampler, sequence manager, and scheduler; (2) model metadata and tensor validation, including missing tensors, incompatible dimensions, unsupported types, truncated files, and incorrect tensor ordering; (3) one complete generation step, from normalization and Q/K/V projections through rotary position handling, attention, residuals, feed-forward layers, logits, sampling, and token append; (4) KV-cache layouts, per-sequence versus block-based allocation, capacity growth, reuse, deletion, and memory scaling with layers, KV heads, head dimension, data type, and token count; (5) CPU performance, including memory bandwidth, cache locality, SIMD, threading, false sharing, NUMA, allocation overhead, and operator fusion; (6) unit tests, numerical reference comparisons, malformed-model tests, long-context tests, concurrency tests, and repeatable benchmarks; and (7) an implementation roadmap with dependencies and measurable acceptance criteria.
+    The target is a locally hosted model with approximately 1.1 billion parameters. The engine must support model loading, tokenization, tensor execution, transformer layers, attention, KV caching, sampling, multiple independent sequences, streaming generation, cancellation, and deterministic execution.
 
-    Distinguish essential requirements from optional optimizations. Explain the reasoning behind design choices, include concrete examples and equations where useful, and make this a substantial engineering design document rather than a short overview.""",
+    Write an extremely detailed architecture document containing the following sections.
 
-    """Analyze this hypothetical production incident in a CPU inference service hosting a 1.1-billion-parameter decoder-only model. Under light load it responds correctly, but during sustained traffic latency rises, memory usage grows, and long conversations become much slower than short ones. The service supports concurrent users, streaming, cancellation, and conversation history.
+    SECTION 1: SYSTEM ARCHITECTURE
+    Define every major subsystem and its responsibilities:
+    - Model loader and model metadata parser.
+    - Tokenizer and vocabulary manager.
+    - Tensor representation and tensor memory management.
+    - CPU operator library.
+    - Linear algebra implementation.
+    - Normalization operators.
+    - Rotary positional embedding implementation.
+    - Attention implementation.
+    - Transformer block.
+    - Feed-forward network.
+    - Logits processor.
+    - Sampling implementation.
+    - Sequence manager.
+    - KV-cache manager.
+    - Scheduler.
+    - Generation controller.
+    - Streaming output interface.
+    - Memory allocator.
+    - Thread pool.
 
-    Produce a comprehensive incident analysis and remediation plan. Give an incident summary and investigate at least these possible causes: KV-cache allocation and fragmentation, failure to release cache after cancellation, accidental cache-state sharing, repeated prompt prefill, unbounded conversation history, context overflow, poor batching, lock contention, thread oversubscription, memory-bandwidth saturation, and allocator behavior.
+    For each component, define its public interface, private state, ownership responsibilities, error conditions, dependencies, and invariants. Explain which components should be independent libraries and which should remain internal implementation details.
 
-    For every cause, explain the mechanism, observable symptoms, measurements that confirm or reject it, and a corrective action. Specify instrumentation for prompt and generated token counts, active sequences, cached tokens per sequence, allocated and used KV blocks, cache hit rate, allocation failures, evictions, prefill and decode duration, queue wait, time to first token, tokens per second, resident memory, and CPU utilization.
+    Describe at least three alternative architectural decompositions. Compare a monolithic inference engine, a layered library architecture, and a graph-oriented execution architecture. Explain the tradeoffs in testing, performance, maintainability, debugging, and future hardware backends.
 
-    Design a load-test matrix varying prompt length, output length, concurrent sequences, arrival rate, cancellation frequency, and conversation reuse. Explain how to separate prefill from decode bottlenecks and distinguish compute, bandwidth, synchronization, and allocation limits. Include staged rollout, rollback, explicit success criteria, and prioritized fixes. Do not assume more worker threads improve throughput. Make the plan detailed enough for an engineering reliability review.""",
+    SECTION 2: MODEL LOADING
+    Specify a complete model-loading pipeline. Discuss model configuration parsing, vocabulary loading, tensor metadata, tensor names, tensor dimensions, quantization metadata, tensor offsets, alignment, file mapping, lazy loading, eager loading, and validation.
 
-    """Prepare a technical comparison of three transformer attention-state strategies: a conventional contiguous KV cache, paged/block-based KV caching, and prefix caching with shared immutable prefix blocks.
+    Explain how the engine should detect:
+    - Missing embeddings.
+    - Missing normalization weights.
+    - Missing attention projections.
+    - Incompatible query and key dimensions.
+    - Invalid grouped-query attention configuration.
+    - Incorrect feed-forward dimensions.
+    - Unsupported activation functions.
+    - Incorrect tensor ordering.
+    - Duplicate tensor names.
+    - Overlapping tensor offsets.
+    - Truncated tensor data.
+    - Invalid quantization metadata.
+    - Integer overflow in tensor-size calculations.
+    - Incorrect vocabulary size.
+    - Incompatible tokenizer and model configuration.
 
-    Define the data model for each strategy: sequence ownership, block contents, logical token positions, physical storage mapping, and key/value layout across layers, KV heads, tokens, and head dimensions. Work through an example where several sequences share an initial prompt and then generate different continuations. Identify shared memory, private memory, and what happens when a sequence is cancelled or finishes.
+    Define the validation order and explain why some errors must be detected before allocating large amounts of memory.
 
-    Compare allocation cost, fragmentation, memory utilization, cache growth, sequence creation and deletion, prefix reuse, copy-on-write, concurrency, implementation complexity, and suitability for CPU inference. Include equations for estimating KV memory. Explain how grouped-query attention affects the estimate and why KV-head count, rather than query-head count, determines cache storage.
+    SECTION 3: TENSOR ENGINE
+    Design a tensor abstraction for C++ that supports multidimensional shapes, strides, offsets, data types, alignment, ownership, non-owning views, slicing, transposition, reshaping, and contiguous storage.
 
-    Address correctness hazards: reference counting, block ownership, partially filled final blocks, block-table updates, token-position continuity, invalidation after model or tokenizer changes, hash collisions in prefix identification, and preventing reuse across requests with incompatible model settings.
+    Define the behavior of tensor copying, moving, aliasing, and destruction. Discuss whether tensors should use shared ownership, unique ownership, or explicit borrowed views.
 
-    End with separate recommendations for a small single-process CPU engine and a high-concurrency serving system. State assumptions, explain when each design stops being attractive, and propose benchmarks that could disprove the recommendations. Make the report analytical and implementation-oriented.""",
+    Explain how tensor shape arithmetic must be implemented safely. Include examples of multiplication overflow, offset overflow, invalid strides, non-contiguous views, and incorrect assumptions about contiguous memory.
 
-    """Specify a rigorous benchmark suite for a C++ transformer inference engine running on a laptop CPU. The goal is to measure how prompt length, generated-token count, KV-cache policy, memory bandwidth, and concurrency affect latency and throughput, while comparing two implementations fairly.
+    Compare row-major and column-major storage. Explain the impact of each on matrix multiplication, attention, and normalization.
 
-    Define workload classes for short prompt/short completion, long prompt/short completion, short prompt/long completion, long prompt/long completion, repeated shared prefixes, unrelated prompts, and multiple concurrent sequences. Explain which subsystem each workload isolates.
+    Define a testing strategy for every tensor operation, including randomized dimensions, unusual strides, empty tensors, singleton dimensions, and boundary dimensions.
 
-    Specify measurements: prompt tokens, generated tokens, prefill time, decode time, time to first token, prefill and decode tokens/second, total wall time, CPU time, CPU utilization, peak resident memory, model size, KV allocated and occupied bytes, allocation count, and energy where available. Define each metric and likely measurement errors.
+    SECTION 4: TRANSFORMER EXECUTION
+    Walk through the complete execution of one transformer layer for a single input token.
 
-    Explain controls for CPU frequency, thermal throttling, background processes, thread count, affinity, memory placement, model loading, page-cache state, and output length. Explain why comparisons require matching token counts and stopping behavior. Describe how to prevent a server prompt cache from invalidating ordinary measurements, and separately design an experiment that intentionally measures prefix-cache benefits.
+    Explain input normalization, query projection, key projection, value projection, head splitting, grouped-query head mapping, rotary embeddings, cache append, attention score computation, causal masking, stable softmax, value aggregation, output projection, residual addition, feed-forward normalization, gate projection, up projection, activation, down projection, and final residual addition.
 
-    Provide a statistical plan using medians, percentiles, dispersion, confidence intervals where appropriate, and outlier investigation. Include a sample results table with units, a reproducibility checklist, and a prioritized sequence of experiments to reveal whether KV-cache changes improve the engine. Make this an actionable benchmark specification.""",
+    Give exact tensor dimensions for a hypothetical model with:
+    - Hidden dimension: 2048.
+    - Query heads: 16.
+    - KV heads: 4.
+    - Head dimension: 128.
+    - Feed-forward dimension: 5632.
+    - Transformer layers: 22.
 
-    """Act as the principal C++ reviewer for a transformer inference engine using a custom tensor abstraction, CPU kernels, a tokenizer, and a sequence-oriented KV-cache interface. A submitted implementation works on short prompts but fails intermittently on long prompts and with several active sequences.
+    Explain how these dimensions determine the sizes of intermediate tensors.
 
-    Write a detailed code-review guide and debugging playbook. Cover tensor shape and stride validation, integer overflow in allocation calculations, alignment, ownership and lifetime, move semantics, exception safety, bounds checking, aliasing, thread safety, and determinism. For attention, inspect Q/K/V dimensions, grouped-query head mapping, head offsets, rotary position indices, causal masking, softmax stability, accumulation precision, and the distinction between the current token and previously cached tokens.
+    Describe the execution differences between prompt prefill and autoregressive decoding. Explain why prefill is generally more parallelizable and why decoding frequently becomes memory-bandwidth-bound.
 
-    State the invariants required before and after every KV append: layer storage, sequence identity, logical token position, physical slot or block mapping, capacity, valid-token count, and allocation-failure behavior. Explain how to detect stale pointers after vector growth, accidental cache sharing, off-by-one errors at block boundaries, incorrect partial-block handling, and corruption after sequence deletion. Include useful assertions and property-based tests.
+    SECTION 5: KV CACHE
+    Develop an exhaustive KV-cache design.
 
-    Give a debugging progression from one-token prompts and one generation step to longer prompts, longer generations, more layers, and more active sequences, increasing one variable at a time. Explain intermediate-tensor comparison against a trusted reference and the use of sanitizers, watchpoints, allocation tracing, and structured logs. Finish with a merge checklist and concrete acceptance tests. Make the guide suitable for an actual C++ code review.""",
+    Compare:
+    - Per-sequence contiguous allocation.
+    - Global contiguous allocation.
+    - Fixed-size block allocation.
+    - PagedAttention-style allocation.
+    - Prefix-shared immutable blocks.
+    - Copy-on-write prefix sharing.
+
+    For each strategy, define its data structures, allocation algorithm, append operation, lookup operation, growth strategy, deletion operation, and memory reclamation strategy.
+
+    Define the exact memory calculation for a model with L layers, Hkv KV heads, D head dimensions, T cached tokens, and B bytes per element.
+
+    Calculate the expected memory for several combinations of token counts, layers, head counts, and data types.
+
+    Explain fragmentation, allocation overhead, cache-line utilization, alignment, and block-table overhead.
+
+    Discuss reference counting, block ownership, partially filled blocks, concurrent append operations, sequence cancellation, and stale block references.
+
+    Explain how the implementation should behave when memory capacity is exhausted. Compare rejecting requests, evicting inactive sequences, evicting least-recently-used prefixes, and reducing context length.
+
+    SECTION 6: CPU PERFORMANCE
+    Analyze the effects of:
+    - Memory bandwidth.
+    - L1, L2, and L3 cache capacity.
+    - SIMD instruction sets.
+    - AVX2.
+    - AVX-512 where available.
+    - Cache-line alignment.
+    - False sharing.
+    - NUMA placement.
+    - Thread scheduling.
+    - Thread oversubscription.
+    - Matrix multiplication blocking.
+    - Operator fusion.
+    - Memory allocation frequency.
+    - Page faults.
+    - Huge pages.
+    - Quantized weights.
+
+    Explain why a faster matrix multiplication kernel does not necessarily improve end-to-end token generation speed.
+
+    SECTION 7: TESTING
+    Specify unit tests, integration tests, numerical tests, concurrency tests, malformed-model tests, long-context tests, memory exhaustion tests, and cancellation tests.
+
+    Define numerical tolerances for comparisons against a trusted implementation. Explain how floating-point accumulation order affects reproducibility.
+
+    SECTION 8: IMPLEMENTATION ROADMAP
+    Divide implementation into independently testable milestones. Define dependencies, deliverables, failure conditions, performance targets, and acceptance criteria for every milestone.
+
+    The final document must be comprehensive, technically precise, and internally consistent. Do not summarize sections. Do not omit implementation details merely because they are complicated. When a design choice has alternatives, analyze each alternative before making a recommendation.""",
+
+    """You are the senior reliability engineer investigating a severe production incident in a CPU inference server hosting a decoder-only transformer model.
+
+    The server initially performs well. After several hours of sustained usage, memory consumption rises continuously, time to first token increases, decode throughput falls, and long-running conversations become dramatically slower.
+
+    The service supports multiple simultaneous users, streaming responses, cancellation, conversation history, prefix caching, and dynamic request scheduling.
+
+    Produce an exhaustive incident investigation report.
+
+    SECTION 1: INCIDENT TIMELINE
+    Construct a hypothetical but technically realistic timeline covering:
+    - Initial deployment.
+    - Normal operation.
+    - First signs of memory growth.
+    - Increased request latency.
+    - First failed allocations.
+    - Increased cancellation frequency.
+    - Service degradation.
+    - Detection.
+    - Mitigation.
+    - Recovery.
+
+    Explain what telemetry should have identified the issue earlier.
+
+    SECTION 2: ROOT-CAUSE INVESTIGATION
+    Investigate each of these possibilities independently:
+    1. KV-cache memory leaks.
+    2. Sequence deletion not releasing blocks.
+    3. Cancellation leaving partially allocated cache state.
+    4. Incorrect reference counting.
+    5. Shared prefix blocks being freed prematurely.
+    6. Prefix blocks never being reclaimed.
+    7. Cache fragmentation.
+    8. Repeated prompt prefill.
+    9. Unbounded conversation histories.
+    10. Context-window overflow.
+    11. Incorrect token accounting.
+    12. Scheduler starvation.
+    13. Lock contention.
+    14. Thread oversubscription.
+    15. CPU memory-bandwidth saturation.
+    16. Allocator fragmentation.
+    17. Memory mapping and page faults.
+    18. Accidental copying of entire KV caches.
+    19. Stale references after vector reallocation.
+    20. Concurrent modification of block tables.
+
+    For every hypothesis, provide:
+    - The underlying mechanism.
+    - A realistic example.
+    - Expected symptoms.
+    - Metrics to inspect.
+    - A confirming experiment.
+    - A rejecting experiment.
+    - The corrective implementation.
+    - Regression tests.
+
+    SECTION 3: OBSERVABILITY
+    Design a complete metrics system.
+
+    Define metrics for:
+    - Requests received.
+    - Requests completed.
+    - Requests cancelled.
+    - Active sequences.
+    - Queued sequences.
+    - Prompt token count.
+    - Generated token count.
+    - Cached token count.
+    - Prefix cache hits.
+    - Prefix cache misses.
+    - KV blocks allocated.
+    - KV blocks occupied.
+    - KV blocks free.
+    - KV blocks shared.
+    - KV blocks evicted.
+    - Allocation failures.
+    - Cache growth events.
+    - Cache copy operations.
+    - Cache reclamation latency.
+    - Prefill duration.
+    - Decode duration.
+    - Time to first token.
+    - Inter-token latency.
+    - Tokens per second.
+    - Queue waiting time.
+    - CPU utilization.
+    - Resident memory.
+    - Virtual memory.
+    - Page faults.
+    - Context switches.
+    - Thread count.
+
+    For every metric, define its unit, aggregation strategy, cardinality constraints, and interpretation.
+
+    Explain which measurements must be collected per request, per sequence, per layer, and globally.
+
+    SECTION 4: LOAD TESTING
+    Design a detailed load-test matrix.
+
+    Test prompt lengths of:
+    128, 512, 1024, 2048, 4096, 8192, 16384, and 32768 tokens.
+
+    Test generation lengths of:
+    16, 64, 128, 256, 512, 1024, and 2048 tokens.
+
+    Test concurrency levels of:
+    1, 2, 4, 8, 16, 32, and 64 sequences.
+
+    Vary request arrival rates, cancellation frequencies, repeated-prefix ratios, and conversation reuse.
+
+    Explain how to isolate prefill cost from decode cost.
+
+    Explain how to identify memory-bandwidth saturation independently from compute saturation.
+
+    SECTION 5: REMEDIATION
+    Propose fixes in priority order.
+
+    Include immediate mitigation, short-term engineering fixes, architectural improvements, and long-term performance work.
+
+    Define a staged rollout, canary deployment, rollback conditions, and post-deployment verification.
+
+    Define numerical success criteria for memory growth, allocation failures, p95 latency, p99 latency, throughput, and cache reclamation.
+
+    Do not assume that adding threads improves performance. Explain how the server should determine its optimal concurrency and worker-thread configuration.
+
+    Make the report suitable for a production reliability review. Every recommendation must have an observable validation method.""",
+
+    """Prepare an exhaustive implementation comparison of three transformer attention-state architectures.
+
+    The architectures are:
+    A. Conventional per-sequence contiguous KV cache.
+    B. Fixed-size paged/block-based KV cache.
+    C. Prefix-sharing KV cache with immutable shared blocks and copy-on-write continuation.
+
+    Do not provide a superficial comparison. Develop the actual data models, algorithms, memory layouts, ownership rules, and complexity implications.
+
+    SECTION 1: FOUNDATIONAL DATA MODEL
+    Define:
+    - Logical sequence identity.
+    - Logical token position.
+    - Physical cache location.
+    - Transformer layer identity.
+    - KV head identity.
+    - Head dimension.
+    - Block identity.
+    - Block ownership.
+    - Shared block references.
+    - Valid-token count.
+    - Block capacity.
+    - Sequence-to-block mapping.
+
+    Explain how a logical sequence position maps to a physical memory address.
+
+    SECTION 2: CONTIGUOUS CACHE
+    Design a contiguous cache.
+
+    Explain allocation, capacity growth, append, lookup, attention reads, sequence deletion, and memory reclamation.
+
+    Compare allocating the maximum context length immediately against geometric growth.
+
+    Discuss reallocations, pointer invalidation, copying costs, capacity slack, fragmentation, and failure handling.
+
+    Show how the design behaves when multiple sequences have radically different lengths.
+
+    SECTION 3: BLOCK-BASED CACHE
+    Design a paged KV cache using fixed-size token blocks.
+
+    Consider block sizes of 8, 16, 32, 64, and 128 tokens.
+
+    Explain the tradeoffs between internal fragmentation, block-table size, allocation frequency, and attention lookup overhead.
+
+    Define a free-list allocator and explain how blocks are returned safely.
+
+    Describe how to implement an append operation when:
+    - The current block has free space.
+    - The current block is full.
+    - No blocks are available.
+    - Allocation partially succeeds.
+    - The sequence is concurrently cancelled.
+
+    Explain how attention traverses blocks without accidentally interpreting unused block slots as valid tokens.
+
+    SECTION 4: PREFIX SHARING
+    Design prefix caching for requests with common initial prompts.
+
+    Consider these sequences:
+
+    Sequence A:
+    "You are a systems engineer. Design a CPU inference engine. Explain memory allocation and KV-cache behavior."
+
+    Sequence B:
+    "You are a systems engineer. Design a CPU inference engine. Explain memory allocation and KV-cache behavior. Now focus on concurrency."
+
+    Sequence C:
+    "You are a systems engineer. Design a CPU inference engine. Explain memory allocation and KV-cache behavior. Now focus on memory fragmentation."
+
+    Explain which tokens can share cache state and which cannot.
+
+    Define prefix identification using token hashes, model identity, tokenizer identity, positional settings, and inference configuration.
+
+    Explain why hashing raw text is insufficient.
+
+    SECTION 5: OWNERSHIP AND CORRECTNESS
+    Develop detailed ownership rules.
+
+    Explain:
+    - Atomic reference counts.
+    - Block pinning.
+    - Copy-on-write.
+    - Partial final blocks.
+    - Shared immutable blocks.
+    - Sequence-specific mutable blocks.
+    - Concurrent append.
+    - Cancellation.
+    - Block reclamation.
+    - Cache invalidation.
+    - Hash collisions.
+    - Model changes.
+    - Tokenizer changes.
+    - RoPE configuration changes.
+
+    Provide invariants for every state transition.
+
+    SECTION 6: MEMORY ANALYSIS
+    Derive the KV memory equation.
+
+    Analyze the effects of:
+    - Layer count.
+    - KV-head count.
+    - Head dimension.
+    - Data type.
+    - Context length.
+    - Number of active sequences.
+    - Block size.
+    - Prefix reuse.
+
+    Explain why GQA changes the cache size and why query-head count is not the correct quantity for calculating KV storage.
+
+    Calculate illustrative memory usage for several hypothetical model configurations.
+
+    SECTION 7: PERFORMANCE ANALYSIS
+    Compare all three architectures in terms of:
+    - Allocation latency.
+    - Append latency.
+    - Attention read overhead.
+    - Memory locality.
+    - Fragmentation.
+    - Cache growth.
+    - Deletion.
+    - Prefix reuse.
+    - Lock contention.
+    - Atomic operations.
+    - Allocator complexity.
+
+    SECTION 8: FINAL RECOMMENDATIONS
+    Give independent recommendations for:
+    - A small single-process CPU engine.
+    - A high-concurrency inference server.
+    - An embedded inference runtime.
+    - A system with highly repetitive prompts.
+
+    Specify benchmark experiments that could prove each recommendation wrong.""",
+
+    """Create a rigorous and extremely detailed benchmark specification for a C++ transformer inference engine running on a CPU-only laptop.
+
+    The benchmark must determine exactly how model size, prompt length, generation length, KV-cache allocation policy, prefix reuse, memory bandwidth, and concurrency affect performance.
+
+    The objective is to compare multiple implementations fairly and identify the exact point at which a particular cache strategy becomes advantageous.
+
+    SECTION 1: WORKLOAD DEFINITIONS
+
+    Define the following workload classes:
+    - Very short prompt and very short generation.
+    - Very short prompt and extremely long generation.
+    - Extremely long prompt and very short generation.
+    - Extremely long prompt and extremely long generation.
+    - Repeated prompts with identical prefixes.
+    - Prompts with partially overlapping prefixes.
+    - Completely unrelated prompts.
+    - Many independent short sequences.
+    - A small number of extremely long sequences.
+    - Sequences with frequent cancellation.
+    - Sequences that grow gradually over several thousand tokens.
+    - Sequences that approach the model context limit.
+
+    Explain what each workload isolates.
+
+    SECTION 2: TOKEN LENGTH MATRIX
+
+    Test prompt lengths:
+    32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, and 32768 tokens.
+
+    Test generation lengths:
+    16, 32, 64, 128, 256, 512, 1024, 2048, and 4096 tokens.
+
+    Test concurrent sequence counts:
+    1, 2, 4, 8, 16, 24, 32, and 64.
+
+    Explain which combinations are particularly important for identifying KV-cache scaling problems.
+
+    SECTION 3: METRICS
+
+    Define:
+    - Prompt processing time.
+    - Time to first token.
+    - Decode duration.
+    - Inter-token latency.
+    - Prefill tokens per second.
+    - Decode tokens per second.
+    - Total request latency.
+    - CPU time.
+    - Wall-clock time.
+    - Peak RSS.
+    - KV allocated bytes.
+    - KV occupied bytes.
+    - KV wasted bytes.
+    - Block allocation count.
+    - Block release count.
+    - Allocation failures.
+    - Cache hit rate.
+    - Cache growth events.
+    - Page faults.
+    - CPU utilization.
+    - Memory bandwidth.
+    - Energy consumption where available.
+
+    Define exact formulas, units, and aggregation methods.
+
+    SECTION 4: EXPERIMENTAL CONTROLS
+
+    Explain how to control:
+    - CPU frequency.
+    - Turbo boost.
+    - Thermal throttling.
+    - Thread count.
+    - CPU affinity.
+    - Background activity.
+    - NUMA placement.
+    - Model loading.
+    - Page-cache state.
+    - Memory allocator.
+    - Compiler optimization flags.
+    - SIMD availability.
+    - Quantization.
+    - Output token count.
+    - Sampling configuration.
+    - Random seeds.
+
+    Explain why both implementations must receive identical token IDs rather than merely identical text.
+
+    SECTION 5: KV-CACHE EXPERIMENTS
+
+    Design experiments that isolate:
+    - Initial allocation.
+    - Incremental growth.
+    - Reallocation.
+    - Block allocation.
+    - Block release.
+    - Sequence deletion.
+    - Cache reuse.
+    - Prefix sharing.
+    - Copy-on-write.
+    - Fragmentation.
+    - Long-running cache occupancy.
+
+    Include a test that creates hundreds of sequences with different lengths, cancels a random subset, continues generating on the remaining sequences, and repeats this cycle many times.
+
+    Explain how to detect memory leaks and fragmentation from these experiments.
+
+    SECTION 6: STATISTICS
+
+    Define warm-up runs, measurement repetitions, median, mean, p50, p90, p95, p99, standard deviation, confidence intervals, and outlier investigation.
+
+    Explain how many repetitions are appropriate for different benchmark durations.
+
+    Explain why a single tokens-per-second result is insufficient.
+
+    SECTION 7: RESULTS
+
+    Provide a sample results table with units and an interpretation guide.
+
+    Define a reproducibility checklist.
+
+    Finish with a prioritized experiment sequence that starts with isolated cache microbenchmarks and progresses toward realistic concurrent workloads.
+
+    Make this a complete experimental protocol, not a general discussion.""",
+
+    """Act as the principal C++ engineer reviewing a submitted transformer inference implementation.
+
+    The implementation works for short prompts and single sequences, but occasionally produces incorrect output after several thousand tokens. It also experiences intermittent crashes when multiple sequences are active.
+
+    Prepare an exhaustive code-review and debugging guide.
+
+    SECTION 1: MEMORY SAFETY
+    Review:
+    - Tensor ownership.
+    - Buffer lifetime.
+    - Move construction.
+    - Move assignment.
+    - Copy semantics.
+    - Non-owning views.
+    - Aliasing.
+    - Alignment.
+    - Bounds checking.
+    - Integer overflow.
+    - Pointer arithmetic.
+    - Vector reallocation.
+    - Exception safety.
+    - Destruction order.
+
+    Give concrete failure scenarios and corrected implementations.
+
+    SECTION 2: KV-CACHE INVARIANTS
+    Define all invariants required before and after KV append.
+
+    Include:
+    - Sequence identity.
+    - Layer identity.
+    - Token position.
+    - Block identity.
+    - Physical offset.
+    - Block capacity.
+    - Valid-token count.
+    - Allocation state.
+    - Ownership state.
+    - Reference count.
+    - Sequence length.
+
+    Explain how every invariant should be validated.
+
+    SECTION 3: ATTENTION CORRECTNESS
+    Review:
+    - Query dimensions.
+    - Key dimensions.
+    - Value dimensions.
+    - Query-head mapping.
+    - KV-head mapping.
+    - Rotary embeddings.
+    - Position indices.
+    - Causal masking.
+    - Softmax stability.
+    - Scaling factors.
+    - Accumulation precision.
+    - Current-token handling.
+    - Historical-token handling.
+
+    Include examples of errors that produce plausible output for short prompts but fail at longer contexts.
+
+    SECTION 4: BLOCK BOUNDARIES
+    Examine block sizes of 8, 16, 32, and 64 tokens.
+
+    For each block size, investigate sequence lengths immediately before, at, and after a block boundary.
+
+    Explain what should happen at lengths:
+    7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, and 129.
+
+    Include partially filled final blocks, full blocks, allocation of the next block, and sequence deletion.
+
+    SECTION 5: CONCURRENCY
+    Investigate:
+    - Concurrent appends.
+    - Concurrent reads.
+    - Concurrent deletion.
+    - Reference-count races.
+    - Block reuse races.
+    - Sequence-ID reuse.
+    - Lock ordering.
+    - Deadlocks.
+    - False sharing.
+    - Data races.
+    - Cancellation during allocation.
+
+    Define a safe locking strategy and discuss when atomics are appropriate.
+
+    SECTION 6: DEBUGGING
+    Provide a progression:
+    1. Empty prompt.
+    2. One input token.
+    3. Two input tokens.
+    4. One generation step.
+    5. Short prompt.
+    6. Short generation.
+    7. One block boundary.
+    8. Multiple block boundaries.
+    9. Long prompt.
+    10. Long generation.
+    11. Multiple sequences.
+    12. Cancellation.
+    13. Prefix sharing.
+    14. Memory exhaustion.
+
+    Explain the use of AddressSanitizer, UndefinedBehaviorSanitizer, ThreadSanitizer, Valgrind, GDB watchpoints, allocation tracing, and reference implementations.
+
+    SECTION 7: TESTING
+    Define unit tests, integration tests, property-based tests, randomized tests, differential tests, and stress tests.
+
+    Provide pseudocode for a randomized test that creates sequences, appends tokens, deletes random sequences, and continuously verifies cache invariants.
+
+    SECTION 8: MERGE CRITERIA
+    Define mandatory acceptance criteria before merging the implementation.
+
+    The document must be specific enough that a reviewer can use it as a practical checklist during an actual code review.""",
+
+    """You are designing an extremely long-context stress test for a CPU-only transformer inference engine.
+
+    The purpose is to discover the exact failure point of its KV-cache implementation. The test must systematically push memory usage, context length, allocation frequency, and sequence concurrency toward their limits.
+
+    Produce a complete stress-testing specification.
+
+    SECTION 1: OBJECTIVES
+    Define tests for:
+    - Maximum context length.
+    - Maximum active sequence count.
+    - Maximum total cached tokens.
+    - Maximum KV allocation.
+    - Maximum block-table size.
+    - Maximum sequence count with fragmented allocations.
+    - Repeated growth.
+    - Repeated deletion.
+    - Cancellation during allocation.
+    - Allocation failure.
+    - Cache reuse.
+    - Prefix sharing.
+    - Memory reclamation.
+
+    SECTION 2: EXTREME CONTEXT TESTS
+    Define prompt lengths of:
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, and 262144 tokens.
+
+    Explain how to adapt these tests to models with smaller context limits without confusing model-level context rejection with cache implementation failure.
+
+    Design tests where the sequence starts small and grows continuously to the maximum supported length.
+
+    Explain how to measure memory after every 256 generated tokens and identify unexpected allocation jumps.
+
+    SECTION 3: CONCURRENCY TESTS
+    Test 1, 2, 4, 8, 16, 32, 64, 128, and 256 active sequences where memory permits.
+
+    Consider mixed sequence lengths, synchronized growth, staggered growth, random cancellation, and random deletion.
+
+    Define tests that deliberately create fragmentation by alternating short-lived and long-lived sequences.
+
+    SECTION 4: MEMORY EXHAUSTION
+    Define behavior when the cache reaches:
+    50%, 70%, 85%, 95%, and 100% of its configured capacity.
+
+    Explain what must happen when a new block cannot be allocated.
+
+    The implementation must not:
+    - Corrupt existing sequences.
+    - Return uninitialized cache data.
+    - Lose ownership information.
+    - Leave partially updated block tables.
+    - Leak blocks.
+    - Deadlock.
+    - Silently truncate sequence history.
+
+    Define the transactional behavior expected from a failed append.
+
+    SECTION 5: LONG-RUNNING TEST
+    Design a test lasting several hours.
+
+    Repeatedly:
+    - Create a set of sequences.
+    - Populate each with a long prompt.
+    - Generate different numbers of tokens.
+    - Cancel a random subset.
+    - Complete the remaining sequences.
+    - Delete finished sequences.
+    - Reuse freed blocks.
+    - Repeat.
+
+    Explain how to identify a leak when RSS does not immediately decrease because the system allocator retains freed memory.
+
+    SECTION 6: VALIDATION
+    Define consistency checks for every layer, every sequence, every block, and every valid token.
+
+    Include checksums or deterministic test patterns to identify data corruption.
+
+    SECTION 7: FAILURE REPORTING
+    Define the logs and diagnostic information captured when:
+    - Allocation fails.
+    - A sequence is cancelled.
+    - A block is released.
+    - A block is reused.
+    - An invariant fails.
+    - A sequence reaches maximum context.
+
+    SECTION 8: ACCEPTANCE CRITERIA
+    Define numerical pass/fail criteria for correctness, memory growth, reclamation, allocation failures, latency, and concurrency.
+
+    Make this suitable for validating a KV cache implementation before it is used by an inference server.""",
+
+    """You are a researcher investigating the relationship between prompt length, KV-cache size, and autoregressive decoding performance.
+
+    Prepare an exhaustive experimental report explaining how inference cost evolves as context length increases.
+
+    SECTION 1: MATHEMATICAL MODEL
+    Derive the KV-cache memory formula:
+
+    KV_bytes = 2 * layers * KV_heads * head_dimension * cached_tokens * bytes_per_element
+
+    Explain every term and derive the formula from the actual key and value tensor dimensions.
+
+    Explain the differences between MHA, GQA, and MQA.
+
+    Calculate cache memory for several hypothetical configurations, including:
+    - 12 layers, 4 KV heads, dimension 64.
+    - 22 layers, 4 KV heads, dimension 128.
+    - 32 layers, 8 KV heads, dimension 128.
+    - 40 layers, 8 KV heads, dimension 128.
+
+    Use FP32, FP16, BF16, and 8-bit cache storage where supported.
+
+    SECTION 2: SCALING
+    Analyze context lengths of:
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, and 131072 tokens.
+
+    Explain linear KV memory growth.
+
+    Distinguish memory allocated from memory actually occupied.
+
+    Explain capacity slack, block fragmentation, and metadata overhead.
+
+    SECTION 3: ATTENTION COMPUTATION
+    Explain why the attention operation for each generated token must consider historical keys and values.
+
+    Analyze how the amount of attention work grows as context increases.
+
+    Compare full attention against sliding-window attention.
+
+    Explain why KV caching avoids recomputing previous projections but does not eliminate historical attention reads.
+
+    SECTION 4: CPU MEMORY BANDWIDTH
+    Estimate the amount of KV data read for a decoding step.
+
+    Explain how batch size and active sequence count affect memory traffic.
+
+    Analyze the relationship between cache storage format and memory bandwidth.
+
+    Discuss whether quantizing the KV cache helps on a laptop CPU with limited memory bandwidth.
+
+    SECTION 5: EXPERIMENTS
+    Design experiments that measure decode latency at each context length.
+
+    Hold the number of generated tokens constant while varying initial context length.
+
+    Then hold initial context length constant while varying generated token count.
+
+    Explain why these experiments isolate different scaling effects.
+
+    SECTION 6: RESULTS INTERPRETATION
+    Provide hypothetical results and explain how to interpret:
+    - Increasing memory usage.
+    - Increasing inter-token latency.
+    - Falling tokens per second.
+    - Stable prefill speed but slower decoding.
+    - Sudden latency jumps at block boundaries.
+    - Decreasing throughput at higher concurrency.
+
+    SECTION 7: CONCLUSIONS
+    Provide implementation recommendations for contiguous, paged, and prefix-sharing caches.
+
+    Identify the experiments that should be performed before adopting each optimization.""",
+
+    """You are the technical lead for a team building a production-quality CPU inference runtime.
+
+    You must prepare a complete engineering implementation plan covering the entire development lifecycle, from initial model loading through high-concurrency generation and long-context memory management.
+
+    The project is divided into multiple engineers working independently. The resulting interfaces must be sufficiently precise to allow parallel implementation.
+
+    SECTION 1: PROJECT REQUIREMENTS
+    Define functional and non-functional requirements.
+
+    Include:
+    - Model compatibility.
+    - Tokenizer compatibility.
+    - Deterministic execution.
+    - Numerical correctness.
+    - Long-context support.
+    - Multiple independent sequences.
+    - Streaming.
+    - Cancellation.
+    - Bounded memory.
+    - Predictable allocation.
+    - Thread safety.
+    - Reproducible benchmarking.
+
+    SECTION 2: PUBLIC INTERFACES
+    Specify C++ interfaces for:
+    - Model.
+    - ModelConfig.
+    - Tensor.
+    - TensorView.
+    - Tokenizer.
+    - Operator.
+    - TransformerLayer.
+    - Attention.
+    - KVCache.
+    - Sequence.
+    - SequenceManager.
+    - Scheduler.
+    - Sampler.
+    - Generator.
+
+    For each interface, explain method responsibilities, parameter semantics, ownership, return values, exceptions, and thread-safety guarantees.
+
+    SECTION 3: KV CACHE API
+    Develop an especially detailed KV-cache interface.
+
+    Define operations for:
+    - Creating a sequence.
+    - Appending a token.
+    - Appending multiple tokens.
+    - Reading keys.
+    - Reading values.
+    - Querying sequence length.
+    - Querying allocated capacity.
+    - Growing storage.
+    - Cloning a prefix.
+    - Sharing immutable blocks.
+    - Detaching shared blocks.
+    - Deleting a sequence.
+    - Cancelling a sequence.
+    - Clearing all sequences.
+    - Reporting memory usage.
+
+    Explain atomicity requirements and failure behavior for every operation.
+
+    SECTION 4: IMPLEMENTATION ORDER
+    Define a dependency graph.
+
+    Identify which modules can be implemented independently and which require completed upstream interfaces.
+
+    Propose milestones for:
+    - Tensor foundations.
+    - File loading.
+    - Tokenization.
+    - CPU operators.
+    - Single-layer execution.
+    - Full transformer execution.
+    - Greedy decoding.
+    - Sampling.
+    - KV caching.
+    - Multiple sequences.
+    - Scheduling.
+    - Streaming.
+    - Prefix caching.
+    - Performance optimization.
+
+    SECTION 5: INTEGRATION
+    Explain how the team should integrate independently developed modules.
+
+    Define API stability requirements, test fixtures, numerical reference outputs, mock components, and integration test stages.
+
+    SECTION 6: QUALITY ASSURANCE
+    Specify static analysis, compiler warnings, sanitizers, fuzzing, unit tests, differential testing, concurrency testing, and performance regression tests.
+
+    SECTION 7: PERFORMANCE GOALS
+    Define measurable targets for model loading, prefill throughput, decode throughput, memory utilization, allocation overhead, cache lookup, and concurrent throughput.
+
+    SECTION 8: FINAL DELIVERABLES
+    List every required design document, interface specification, implementation, test suite, benchmark, and operational guide.
+
+    Make the result detailed enough to serve as the team's primary engineering execution plan."""
 ]
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE / "results"
