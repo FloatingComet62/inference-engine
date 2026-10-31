@@ -174,7 +174,7 @@ def chat_template(system, user):
 # ---------------------------------------------------------------- our engine
 def run_engine(a, user):
     cmd = [a.bin, "bench", "--model", a.model, "--tokenizer", a.tokenizer,
-           "-p", user, "--system", tagged_system(), "-n", str(a.n), "--threads", str(a.threads)]
+           "-p", user, "--system", tagged_system(), "-n", str(a.n), "--threads", str(a.threads)] + a.engine_args.split()
     with Energy() as e:
         p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -330,6 +330,7 @@ def main():
                     help="default: scripts/physical_cores.sh, the same as the Makefile")
     ap.add_argument("-n", type=int, default=512, help="max new tokens per run (long benchmark default)")
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--engine-args", default="", help='extra engine flags, e.g. "--kv q8 --spec ngram"')
     ap.add_argument("--quality", action="store_true", help="also measure perplexity vs fp32 reference")
     ap.add_argument("--ref-model", default="models/tinyllama-f32.bin", help="fp32 reference for quality")
     ap.add_argument("--eval-text", default=str(EVAL_TEXT))
