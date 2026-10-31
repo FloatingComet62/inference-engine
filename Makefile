@@ -110,11 +110,20 @@ bench-ollama:
 compare: build model
 	@$(PY) bench/compare.py $(BENCH_ARGS) --only both
 
+bench-longer: build model
+	@$(PY) bench/compare-longer.py $(BENCH_ARGS) --only engine
+
+bench-ollama-longer:
+	@$(PY) bench/compare-longer.py $(BENCH_ARGS) --only ollama
+
+compare-longer: build model
+	@$(PY) bench/compare-longer.py $(BENCH_ARGS) --only both
+
 bandwidth: build
 	@OMP_NUM_THREADS=$(THREADS) $(BUILD)/bandwidth
 
 ollama-serve:
-	OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" sudo pkill ollama && ollama serve
+	sudo pkill ollama && OLLAMA_LLM_LIBRARY=cpu_avx2 CUDA_VISIBLE_DEVICES="" ollama serve
 
 ollama-pull:
 	ollama pull $(OLLAMA_MODEL)
