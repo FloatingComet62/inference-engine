@@ -66,6 +66,7 @@ do not repeat text; see P5 below for where it pays.
 | 24 | Dashboard (`/dashboard`) + per-reply speed stats in Open WebUI | results now record suite, model and flags | yes |
 | 25 | OpenMP tuned vs spin pool (`--pool omp` + `OMP_PLACES` P-cores, `OMP_PROC_BIND=close`, `OMP_WAIT_POLICY=active`) | ties: decode 60.5 vs 60.6, prefill 223 vs 226; untuned OpenMP 56 / 198 | no change (pool stays default) |
 | 26 | Multi-machine pipeline over Open MPI (`make mpi-run`, `tinyllama pipe`) with micro-batching | 1 laptop: 4 requests in one micro-batch 183 tok/s total vs 61 for one (3.0x); 8 in one 197. 2 ranks on the SAME laptop: 187 (they share its memory bandwidth, so no gain expected); stream 0 output byte-identical to `run -t 0` | yes (opt-in build, `-DTL_MPI=ON`) |
+| 27 | Two laptops over Wi-Fi: enigma (i5-13420H, 41 GB/s) + pegasus (i7-14650HX, 79 GB/s), layers split 8/14 | 40 requests, batches of 4: 133 tok/s total vs 317 pegasus alone, 177 enigma alone; machines busy 19-35%. Link measured 2.7 MB/s, ping 8-207 ms: ~30 MB of activations is ~11 s on that link. Output identical | works; needs wired LAN to pay off |
 
 ## Multi-machine (Open MPI)
 
