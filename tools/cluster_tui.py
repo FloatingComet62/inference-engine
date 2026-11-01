@@ -72,7 +72,7 @@ def local_prte():
     return out[0].split()[-1] if out else ""   # "prted (PRRTE) 3.0.8"
 
 
-def ssh_open(ip, timeout=0.4):
+def ssh_open(ip, timeout=1.5):   # Wi-Fi round trips reach 200 ms; 254 probes at once add more
     try:
         with socket.create_connection((ip, 22), timeout=timeout):
             return True
@@ -137,6 +137,9 @@ class App:
         first = [h for h in hosts if str(h) in neigh]   # known neighbours first
         with cf.ThreadPoolExecutor(256) as ex:
             found = [str(h) for h, ok in zip(first + hosts, ex.map(lambda h: ssh_open(str(h)), first + hosts)) if ok]
+            # second, slower try for known neighbours that missed the burst
+            missed = [str(h) for h in first if str(h) not in found]
+            found += [ip for ip, ok in zip(missed, ex.map(lambda ip: ssh_open(ip, 3.0), missed)) if ok]
         found = sorted(set(found) - {self.my_ip}, key=lambda s: ipaddress.ip_address(s))
         old = {n.ip: n for n in self.nodes}
         self.nodes = [old.get(self.my_ip) or Node(self.my_ip, self.me, local=True)]
@@ -259,18 +262,25 @@ class App:
     def draw(self, scr):
         scr.erase()
         h, w = scr.getmaxyx()
-        put = lambda y, x, s, a=0: scr.addstr(y, x, s[: max(0, w - x - 1)], a) if 0 <= y < h else None
+        def put(y, x, s, a=0):   # clipped to the window; curses errors on the last cell are ignored
+            if 0 <= y < h and x < w - 1 and s:
+                try:
+                    scr.addstr(y, x, s[: w - x - 1], a)
+                except curses.error:
+                    pass
         put(0, 0, f" tinyllama cluster | {self.my_ip} on {self.net} | PRTE needed: {self.want_prte or '?'} ",
             curses.A_REVERSE)
-        put(1, 0, "  sel host            ip               user       cpu                        cores  ram GB  status")
+        put(1, 0, "  sel host            status                         ip               user       cores ram GB  cpu")
         for k, n in enumerate(self.nodes):
             i = n.info
             st = n.status(self.want_prte)
             color = curses.color_pair(1 if st == "ready" else 3 if st == "checking" else 2)
-            row = (f"  [{'x' if n.selected else ' '}] {(i.get('host', '?') + (' (this)' if n.local else ''))[:15]:15} "
-                   f"{n.ip:16} {n.user[:10]:10} {i.get('cpu', '')[:26]:26} {i.get('cores', ''):>5} {i.get('ram', ''):>7}  ")
-            put(2 + k, 0, row, curses.A_REVERSE if k == self.cur else 0)
-            put(2 + k, len(row), st, color | (curses.A_REVERSE if k == self.cur else 0))
+            hi = curses.A_REVERSE if k == self.cur else 0
+            head = f"  [{'x' if n.selected else ' '}] {(i.get('host', '?') + (' (this)' if n.local else ''))[:15]:15} "
+            put(2 + k, 0, head, hi)
+            put(2 + k, len(head), f"{st[:30]:30} ", color | hi)
+            put(2 + k, len(head) + 31, f"{n.ip:16} {n.user[:10]:10} {i.get('cores', ''):>5} {i.get('ram', ''):>6}  "
+                f"{i.get('cpu', '')}", hi)
         top = 3 + len(self.nodes)
         put(top, 0, "-" * (w - 1))
         with self.lock:
