@@ -46,7 +46,7 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
-	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_HOSTS=192.168.1.10:1,192.168.1.11:1)"
+	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_HOSTS=thishost:1,otherhost:1)"
 	@echo "  make mpi-bench     MPI throughput sweep (streams x micro-batch) -> bench/results/mpi.jsonl"
 	@echo "  make up            start Ollama + this engine's API + Open WebUI (make down stops them)"
 	@echo "  make serve         OpenAI-compatible API for this engine on :8000"
@@ -225,21 +225,32 @@ distclean: clean
 	rm -rf $(MODELS)
 
 # ---- multi-machine: pipeline parallel over Open MPI (src/pipeline.cpp) ----
-# Every machine needs the same repo path, `make mpi-build`, the q4a model and passwordless SSH.
+# Each machine needs: Open MPI of the SAME version, the repo (any path) with `make mpi-build`
+# and models/tinyllama-q4a.bin + tokenizer.bin, passwordless SSH from here, and a symlink
+# /tmp/inference-engine -> its repo (mpirun starts every rank in that one path):
+#   ssh <host> 'ln -sfn <its repo path> /tmp/inference-engine'     (again after a reboot)
+# MPI_HOSTS takes hostnames as `ssh` knows them, with this machine's own hostname first
+# (Open MPI does not recognise this machine by its IP): MPI_HOSTS=enigma:1,pegasus:1
+# IPv6 is off for MPI traffic: some builds advertise only an IPv6 address, which an IPv4 peer
+# cannot pair with ("Unable to find reachable pairing").
 NP        ?= 2
 MPI_IFACE ?= $(shell scripts/lan_subnet.sh)
 MPI_HOSTS ?=
+MPI_WDIR  ?= /tmp/inference-engine
 STREAMS   ?= 4
 MICRO     ?= 4
-# Every machine must run the SAME Open MPI version. A copy built into ~/.local/openmpi-<ver>
-# (to match the other machines' packages) is used automatically; else the system one.
+# A copy of Open MPI built into ~/.local/openmpi-<ver> (to match the other machines'
+# packaged version) is used automatically; else the system one. Such a build tells remote
+# machines to use ITS install path, so MPI_PREFIX names theirs (Arch/Debian/Ubuntu: /usr).
 MPI_HOME  ?= $(lastword $(wildcard $(HOME)/.local/openmpi-*))
 MPI_BIN   := $(if $(MPI_HOME),$(MPI_HOME)/bin/,)
-# mpirun via PATH, not by full path: a full path makes the other machines look for
-# Open MPI at that same prefix instead of using their own install.
-MPIRUN    := $(if $(MPI_HOME),PATH=$(MPI_BIN):$$PATH) mpirun -np $(NP) --mca btl tcp,self --mca btl_tcp_if_include $(MPI_IFACE) \
+MPI_PREFIX ?= /usr
+MPI_ARGS  := -np $(NP) --mca btl tcp,self --mca btl_tcp_if_include $(MPI_IFACE) --mca btl_tcp_disable_family 6 \
              $(if $(filter-out lo,$(MPI_IFACE)),--prtemca oob_tcp_if_include $(MPI_IFACE)) \
-             $(if $(MPI_HOSTS),--host $(MPI_HOSTS))
+             $(if $(MPI_HOSTS),--host $(MPI_HOSTS) --wdir $(MPI_WDIR)) \
+             $(if $(and $(MPI_HOME),$(MPI_HOSTS)),--prefix $(MPI_PREFIX))
+MPI_ENV   := $(if $(MPI_HOME),PATH=$(MPI_BIN):$$PATH)
+MPIRUN    := $(MPI_ENV) mpirun $(MPI_ARGS)
 
 mpi-build:
 	@cmake -S . -B build-mpi -DCMAKE_BUILD_TYPE=Release -DTL_MPI=ON \
@@ -247,8 +258,10 @@ mpi-build:
 	@cmake --build build-mpi -j
 
 mpi-run: mpi-build
+	@ln -sfn $(CURDIR) $(MPI_WDIR)
 	$(MPIRUN) build-mpi/tinyllama pipe --model $(MODELS)/tinyllama-q4a.bin --tokenizer $(TOKENIZER) \
 	    -p "$(PROMPT)" -n $(N) --streams $(STREAMS) --micro $(MICRO)
 
 mpi-bench: mpi-build
-	$(if $(MPI_HOME),PATH=$(MPI_BIN):$$PATH) bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)
+	@ln -sfn $(CURDIR) $(MPI_WDIR)
+	$(MPI_ENV) MPI_ARGS="$(strip $(MPI_ARGS))" bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)

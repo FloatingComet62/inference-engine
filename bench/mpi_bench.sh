@@ -4,14 +4,18 @@
 # Usage: bench/mpi_bench.sh <np> <iface> [hosts] [n]
 #   np     MPI ranks (machines x ranks per machine)
 #   iface  LAN subnet (e.g. 192.168.1.0/24, see scripts/lan_subnet.sh) or interface; lo = one machine
-#   hosts  mpirun --host list of LAN IPs, e.g. "192.168.1.10:1,192.168.1.11:1" (empty = this machine)
+#   hosts  mpirun --host list of hostnames, this machine first, e.g. "enigma:1,pegasus:1" (empty = this machine)
 set -euo pipefail
 NP=${1:?np}; IFACE=${2:?iface}; HOSTS=${3:-}; N=${4:-64}
 OUT=bench/results/mpi.jsonl
 mkdir -p bench/results
-MPI=(mpirun -np "$NP" --mca btl tcp,self --mca btl_tcp_if_include "$IFACE")
-[ "$IFACE" != lo ] && MPI+=(--prtemca oob_tcp_if_include "$IFACE")   # launcher's channel; refuses loopback
-[ -n "$HOSTS" ] && MPI+=(--host "$HOSTS")
+if [ -n "${MPI_ARGS:-}" ]; then   # from the Makefile (has --host, --wdir, --prefix as needed)
+    read -ra extra <<< "$MPI_ARGS"; MPI=(mpirun "${extra[@]}")
+else
+    MPI=(mpirun -np "$NP" --mca btl tcp,self --mca btl_tcp_if_include "$IFACE" --mca btl_tcp_disable_family 6)
+    [ "$IFACE" != lo ] && MPI+=(--prtemca oob_tcp_if_include "$IFACE")   # launcher's channel; refuses loopback
+    [ -n "$HOSTS" ] && MPI+=(--host "$HOSTS" --wdir /tmp/inference-engine)
+fi
 for cfg in "1 1" "4 1" "4 4" "8 4" "8 8" "16 8"; do
     set -- $cfg
     line=$("${MPI[@]}" build-mpi/tinyllama pipe --model models/tinyllama-q4a.bin --tokenizer models/tokenizer.bin \
