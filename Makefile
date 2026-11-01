@@ -33,7 +33,7 @@ BENCH_ARGS  := --bin $(BIN) --model $(WEIGHTS) --tokenizer $(TOKENIZER) --thread
                --bandwidth-bin $(BUILD)/bandwidth --ref-model $(F32_WEIGHTS) --engine-args "$(ENGINE_FLAGS)" $(if $(filter 1,$(QUALITY)),--quality)
 
 .PHONY: help setup deps build debug model run chat bench bench-ollama compare bandwidth \
-        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui up down mpi-build mpi-run mpi-bench
+        ollama-serve ollama-pull ollama-run smoke clean distclean venv rapl-perms ppl eval serve webui up down mpi-build mpi-run mpi-bench cluster
 
 help:
 	@echo "TinyLlama CPU inference engine"
@@ -46,6 +46,7 @@ help:
 	@echo "  make bench-ollama  benchmark Ollama only"
 	@echo "  make bandwidth     measure memory bandwidth (the speed ceiling)"
 	@echo "  make ppl           perplexity on bench/data/eval.txt (quality)"
+	@echo "  make cluster       TUI: find LAN machines, set them up, run/benchmark across them"
 	@echo "  make mpi-run       pipeline across machines with MPI (NP=2 MPI_HOSTS=thishost:1,otherhost:1)"
 	@echo "  make mpi-bench     MPI throughput sweep (streams x micro-batch) -> bench/results/mpi.jsonl"
 	@echo "  make up            start Ollama + this engine's API + Open WebUI (make down stops them)"
@@ -265,3 +266,6 @@ mpi-run: mpi-build
 mpi-bench: mpi-build
 	@ln -sfn $(CURDIR) $(MPI_WDIR)
 	$(MPI_ENV) MPI_ARGS="$(strip $(MPI_ARGS))" bench/mpi_bench.sh $(NP) $(MPI_IFACE) "$(MPI_HOSTS)" $(N)
+
+cluster:
+	@$(PY) tools/cluster_tui.py

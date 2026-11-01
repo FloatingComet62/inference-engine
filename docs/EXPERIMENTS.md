@@ -70,6 +70,12 @@ do not repeat text; see P5 below for where it pays.
 
 ## Multi-machine (Open MPI)
 
+`make cluster` opens a terminal UI that does all of the below for you: it scans the LAN for machines
+answering on SSH, logs in to each to show CPU, cores, free RAM and readiness (repo, `/tmp/inference-engine`
+link, MPI build, model, matching PRTE version), and lets you install your SSH key (`k`), set a machine up
+(`s`: clone, link, build, copy the model), select machines (space) and generate (`g`) or benchmark (`b`)
+across them. SSH users per address are kept in `~/.config/tinyllama-cluster/users.json`.
+
 `make mpi-run NP=2 MPI_HOSTS=192.168.1.10:1,192.168.1.11:1` (LAN IPs, one rank each). MPI traffic is pinned to this machine's LAN subnet (`scripts/lan_subnet.sh`, e.g. `192.168.1.0/24`), which works whatever each machine calls its interface; override with `MPI_IFACE=<subnet or interface>`, or `MPI_IFACE=lo` with no hosts for one machine.
 Every machine needs the repo at the same path, `make mpi-build`, `models/tinyllama-q4a.bin` + `tokenizer.bin`,
 Open MPI and passwordless SSH from the first host. `make mpi-bench` sweeps streams x micro-batch into
